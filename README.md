@@ -49,9 +49,10 @@ KeyFence is an egress-controlled credential containment proxy for bearer tokens,
 │  2. Find kf_ token in headers        │
 │  3. Validate: TTL, destination,      │
 │     method, path, rate limit         │
-│  4. Fetch real credential from       │
-│     backend                          │
-│  5. Swap token → real credential     │
+│  4. Fetch credential / client cert    │
+│  5. Inject credential in header,     │
+│     present client cert on upstream  │
+│     TLS                              │
 │  6. Forward to upstream              │
 └──────────────┬───────────────────────┘
                │
