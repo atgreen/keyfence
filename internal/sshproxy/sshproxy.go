@@ -38,6 +38,7 @@ import (
 	"go.opentelemetry.io/otel/codes"
 	"golang.org/x/crypto/ssh"
 
+	"github.com/keyfence/keyfence/internal/acl"
 	"github.com/keyfence/keyfence/internal/audit"
 	"github.com/keyfence/keyfence/internal/credstore"
 	"github.com/keyfence/keyfence/internal/telemetry"
@@ -51,12 +52,13 @@ type Server struct {
 	store   *tokenstore.Store
 	sshKeys *credstore.SSHKeyStore
 	audit   *audit.Logger
+	acl     *acl.List
 	config  *ssh.ServerConfig
 }
 
 // New creates an SSH bastion server. It loads or generates a host key
 // from hostKeyDir.
-func New(addr string, hostKeyDir string, store *tokenstore.Store, sshKeys *credstore.SSHKeyStore, auditLog *audit.Logger) (*Server, error) {
+func New(addr string, hostKeyDir string, store *tokenstore.Store, sshKeys *credstore.SSHKeyStore, auditLog *audit.Logger, aclList *acl.List) (*Server, error) {
 	hostKey, err := loadOrCreateHostKey(hostKeyDir)
 	if err != nil {
 		return nil, fmt.Errorf("host key: %w", err)
@@ -67,6 +69,7 @@ func New(addr string, hostKeyDir string, store *tokenstore.Store, sshKeys *creds
 		store:   store,
 		sshKeys: sshKeys,
 		audit:   auditLog,
+		acl:     aclList,
 	}
 
 	s.config = &ssh.ServerConfig{
@@ -188,6 +191,22 @@ func (s *Server) handleDirectTCPIP(token *tokenstore.Token, tokenValue string, n
 
 	dest := net.JoinHostPort(req.DestHost, fmt.Sprintf("%d", req.DestPort))
 	span.SetAttributes(attribute.String("net.peer.name", dest))
+
+	// Global deny list
+	if s.acl.IsDenied(req.DestHost, "") {
+		s.audit.Log(audit.Entry{
+			Event:       audit.EventSSHDeny,
+			TokenID:     token.ID,
+			AgentID:     token.AgentID,
+			TaskID:      token.TaskID,
+			Destination: dest,
+			DenyRule:    "acl_deny",
+			DenyReason:  fmt.Sprintf("destination %s is on the deny list", req.DestHost),
+		})
+		span.SetStatus(codes.Error, "acl_deny")
+		newChan.Reject(ssh.Prohibited, fmt.Sprintf("destination %s is blocked", req.DestHost))
+		return
+	}
 
 	// Check rate limit
 	if token.RateLimit > 0 && !s.store.CheckRate(tokenValue) {
