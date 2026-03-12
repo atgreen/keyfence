@@ -42,6 +42,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/keyfence/keyfence/internal/audit"
 	"github.com/keyfence/keyfence/internal/credstore"
 	"github.com/keyfence/keyfence/internal/policy"
 	"github.com/keyfence/keyfence/internal/proxy"
@@ -70,6 +71,8 @@ func main() {
 		}
 		log.Printf("ca cert exported to %s/ca.pem", *certsDir)
 	}
+
+	auditLog := audit.New(os.Stdout)
 
 	store := tokenstore.New()
 	creds := credstore.NewEnvBackend()
@@ -101,7 +104,7 @@ func main() {
 	})
 
 	// Start proxy
-	p := proxy.New(*proxyAddr, ca, store, creds, pol, dlp)
+	p := proxy.New(*proxyAddr, ca, store, creds, pol, dlp, auditLog)
 	go func() {
 		if err := p.ListenAndServe(); err != nil {
 			log.Fatalf("proxy: %v", err)
@@ -110,9 +113,10 @@ func main() {
 
 	// Token management API
 	mux := http.NewServeMux()
-	mux.HandleFunc("POST /tokens", handleIssueToken(store, creds))
+	mux.HandleFunc("POST /tokens", handleIssueToken(store, creds, auditLog))
 	mux.HandleFunc("GET /tokens", handleListTokens(store))
-	mux.HandleFunc("DELETE /tokens/{token}", handleRevokeToken(store))
+	mux.HandleFunc("DELETE /tokens/{token}", handleRevokeToken(store, auditLog))
+	mux.HandleFunc("DELETE /tasks/{task_id}/tokens", handleRevokeByTask(store, auditLog))
 	mux.HandleFunc("GET /policies", handleListPolicies(pol))
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -159,6 +163,8 @@ type issueRequest struct {
 	TTLSeconds   int      `json:"ttl_seconds"`
 	Label        string   `json:"label"`
 	Policy       string   `json:"policy"`
+	AgentID      string   `json:"agent_id"`
+	TaskID       string   `json:"task_id"`
 }
 
 type issueResponse struct {
@@ -167,9 +173,11 @@ type issueResponse struct {
 	Destinations []string `json:"destinations"`
 	Label        string   `json:"label,omitempty"`
 	Policy       string   `json:"policy,omitempty"`
+	AgentID      string   `json:"agent_id,omitempty"`
+	TaskID       string   `json:"task_id,omitempty"`
 }
 
-func handleIssueToken(store *tokenstore.Store, creds credstore.Backend) http.HandlerFunc {
+func handleIssueToken(store *tokenstore.Store, creds credstore.Backend, auditLog *audit.Logger) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var req issueRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -193,14 +201,21 @@ func handleIssueToken(store *tokenstore.Store, creds credstore.Backend) http.Han
 			ttl = 5 * time.Minute
 		}
 
-		token, err := store.Issue(credID, req.Destinations, ttl, req.Label, req.Policy)
+		token, err := store.Issue(credID, req.Destinations, ttl, req.Label, req.Policy, req.AgentID, req.TaskID)
 		if err != nil {
 			http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err), 500)
 			return
 		}
 
-		log.Printf("TOKEN ISSUED id=%s label=%q destinations=%v policy=%q ttl=%s",
-			token.ID, token.Label, token.AllowedDestinations, token.PolicyName, ttl)
+		auditLog.Log(audit.Entry{
+			Event:   audit.EventIssue,
+			TokenID: token.ID,
+			AgentID: token.AgentID,
+			TaskID:  token.TaskID,
+			Label:   token.Label,
+			Policy:  token.PolicyName,
+			TTL:     ttl.String(),
+		})
 
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(issueResponse{
@@ -209,6 +224,8 @@ func handleIssueToken(store *tokenstore.Store, creds credstore.Backend) http.Han
 			Destinations: token.AllowedDestinations,
 			Label:        token.Label,
 			Policy:       token.PolicyName,
+			AgentID:      token.AgentID,
+			TaskID:       token.TaskID,
 		})
 	}
 }
@@ -223,6 +240,8 @@ func handleListTokens(store *tokenstore.Store) http.HandlerFunc {
 			Destinations []string `json:"destinations"`
 			Label        string   `json:"label,omitempty"`
 			Policy       string   `json:"policy,omitempty"`
+			AgentID      string   `json:"agent_id,omitempty"`
+			TaskID       string   `json:"task_id,omitempty"`
 		}
 		result := make([]entry, 0, len(tokens))
 		for _, t := range tokens {
@@ -233,6 +252,8 @@ func handleListTokens(store *tokenstore.Store) http.HandlerFunc {
 				Destinations: t.AllowedDestinations,
 				Label:        t.Label,
 				Policy:       t.PolicyName,
+				AgentID:      t.AgentID,
+				TaskID:       t.TaskID,
 			})
 		}
 		w.Header().Set("Content-Type", "application/json")
@@ -240,16 +261,37 @@ func handleListTokens(store *tokenstore.Store) http.HandlerFunc {
 	}
 }
 
-func handleRevokeToken(store *tokenstore.Store) http.HandlerFunc {
+func handleRevokeToken(store *tokenstore.Store, auditLog *audit.Logger) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		tokenValue := r.PathValue("token")
 		if store.Revoke(tokenValue) {
-			log.Printf("TOKEN REVOKED token=%s", tokenValue)
+			auditLog.Log(audit.Entry{
+				Event:   audit.EventRevoke,
+				TokenID: tokenValue,
+			})
 			w.Header().Set("Content-Type", "application/json")
 			json.NewEncoder(w).Encode(map[string]string{"status": "revoked"})
 		} else {
 			http.Error(w, `{"error":"token not found"}`, 404)
 		}
+	}
+}
+
+func handleRevokeByTask(store *tokenstore.Store, auditLog *audit.Logger) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		taskID := r.PathValue("task_id")
+		if taskID == "" {
+			http.Error(w, `{"error":"task_id is required"}`, 400)
+			return
+		}
+		count := store.RevokeByTaskID(taskID)
+		auditLog.Log(audit.Entry{
+			Event:  audit.EventRevoke,
+			TaskID: taskID,
+			Label:  fmt.Sprintf("bulk revoke: %d tokens", count),
+		})
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{"status": "revoked", "count": count})
 	}
 }
 

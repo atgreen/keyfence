@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/keyfence/keyfence/internal/audit"
 	"github.com/keyfence/keyfence/internal/credstore"
 	"github.com/keyfence/keyfence/internal/policy"
 	"github.com/keyfence/keyfence/internal/tokenstore"
@@ -35,21 +36,23 @@ import (
 // about Anthropic, OpenAI, or any other API. The token carries all
 // the information: what credential to inject and where it's allowed.
 type Proxy struct {
-	ca      *CA
-	store   *tokenstore.Store
-	creds   credstore.Backend
-	policy  *policy.Engine
-	dlp     *DLPScanner
-	addr    string
+	ca     *CA
+	store  *tokenstore.Store
+	creds  credstore.Backend
+	policy *policy.Engine
+	dlp    *DLPScanner
+	audit  *audit.Logger
+	addr   string
 }
 
-func New(addr string, ca *CA, store *tokenstore.Store, creds credstore.Backend, pol *policy.Engine, dlp *DLPScanner) *Proxy {
+func New(addr string, ca *CA, store *tokenstore.Store, creds credstore.Backend, pol *policy.Engine, dlp *DLPScanner, auditLog *audit.Logger) *Proxy {
 	return &Proxy{
 		ca:     ca,
 		store:  store,
 		creds:  creds,
 		policy: pol,
 		dlp:    dlp,
+		audit:  auditLog,
 		addr:   addr,
 	}
 }
@@ -140,6 +143,14 @@ func (p *Proxy) processRequest(clientConn net.Conn, req *http.Request, targetHos
 	// Find kf_ token in any header
 	tokenValue, tokenHeader := findToken(req)
 	if tokenValue == "" {
+		p.audit.Log(audit.Entry{
+			Event:       audit.EventDeny,
+			Destination: targetHost,
+			Method:      req.Method,
+			Path:        req.URL.Path,
+			DenyRule:    "no_token",
+			DenyReason:  "no keyfence token found in request headers",
+		})
 		writeError(clientConn, 401, "no keyfence token found in request headers")
 		return
 	}
@@ -147,14 +158,31 @@ func (p *Proxy) processRequest(clientConn net.Conn, req *http.Request, targetHos
 	// Resolve token
 	token := p.store.Resolve(tokenValue)
 	if token == nil {
+		p.audit.Log(audit.Entry{
+			Event:       audit.EventDeny,
+			Destination: targetHost,
+			Method:      req.Method,
+			Path:        req.URL.Path,
+			DenyRule:    "invalid_token",
+			DenyReason:  "invalid or expired keyfence token",
+		})
 		writeError(clientConn, 403, "invalid or expired keyfence token")
 		return
 	}
 
 	// Check destination
 	if !token.IsDestinationAllowed(targetHost) {
-		log.Printf("DENY destination=%s token=%s allowed=%v",
-			targetHost, token.ID, token.AllowedDestinations)
+		p.audit.Log(audit.Entry{
+			Event:       audit.EventDeny,
+			TokenID:     token.ID,
+			AgentID:     token.AgentID,
+			TaskID:      token.TaskID,
+			Destination: targetHost,
+			Method:      req.Method,
+			Path:        req.URL.Path,
+			DenyRule:    "destination",
+			DenyReason:  fmt.Sprintf("token not allowed for destination %s", targetHost),
+		})
 		writeError(clientConn, 403, fmt.Sprintf("token not allowed for destination %s", targetHost))
 		return
 	}
@@ -162,7 +190,18 @@ func (p *Proxy) processRequest(clientConn net.Conn, req *http.Request, targetHos
 	// Policy check
 	if p.policy != nil {
 		if deny := p.policy.Check(token.PolicyName, token.ID, req); deny != nil {
-			log.Printf("POLICY DENY token=%s rule=%s: %s", token.ID, deny.Rule, deny.Message)
+			p.audit.Log(audit.Entry{
+				Event:       audit.EventDeny,
+				TokenID:     token.ID,
+				AgentID:     token.AgentID,
+				TaskID:      token.TaskID,
+				Destination: targetHost,
+				Method:      req.Method,
+				Path:        req.URL.Path,
+				Policy:      token.PolicyName,
+				DenyRule:    deny.Rule,
+				DenyReason:  deny.Message,
+			})
 			writeError(clientConn, 403, deny.Message)
 			return
 		}
@@ -178,8 +217,17 @@ func (p *Proxy) processRequest(clientConn net.Conn, req *http.Request, targetHos
 		req.Body.Close()
 
 		if result := p.dlp.Scan(body); result != nil && result.Matched {
-			log.Printf("DLP BLOCK pattern=%s size=%d destination=%s",
-				result.PatternName, len(body), targetHost)
+			p.audit.Log(audit.Entry{
+				Event:       audit.EventDeny,
+				TokenID:     token.ID,
+				AgentID:     token.AgentID,
+				TaskID:      token.TaskID,
+				Destination: targetHost,
+				Method:      req.Method,
+				Path:        req.URL.Path,
+				DenyRule:    "dlp:" + result.PatternName,
+				DenyReason:  fmt.Sprintf("credential pattern detected (%s)", result.PatternName),
+			})
 			writeError(clientConn, 403, fmt.Sprintf("request blocked: credential pattern detected (%s)", result.PatternName))
 			return
 		}
@@ -208,8 +256,16 @@ func (p *Proxy) processRequest(clientConn net.Conn, req *http.Request, targetHos
 		req.Header.Set(tokenHeader, newVal)
 	}
 
-	log.Printf("ALLOW token=%s destination=%s %s %s",
-		token.ID, targetHost, req.Method, req.URL.Path)
+	p.audit.Log(audit.Entry{
+		Event:       audit.EventAllow,
+		TokenID:     token.ID,
+		AgentID:     token.AgentID,
+		TaskID:      token.TaskID,
+		Destination: targetHost,
+		Method:      req.Method,
+		Path:        req.URL.Path,
+		Policy:      token.PolicyName,
+	})
 
 	// Forward to upstream
 	upstreamResp, err := p.forwardRequest(req, targetHost)

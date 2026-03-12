@@ -22,6 +22,8 @@ type Token struct {
 	CredentialID        string   // reference into credential backend
 	AllowedDestinations []string // hosts this token can be used against
 	PolicyName          string   // optional policy to evaluate on each request
+	AgentID             string   // orchestrator-assigned agent identity
+	TaskID              string   // orchestrator-assigned task scope
 	CreatedAt           time.Time
 	ExpiresAt           time.Time
 	Label               string // optional human-readable label
@@ -59,7 +61,7 @@ func New() *Store {
 	}
 }
 
-func (s *Store) Issue(credentialID string, allowedDestinations []string, ttl time.Duration, label string, policyName string) (*Token, error) {
+func (s *Store) Issue(credentialID string, allowedDestinations []string, ttl time.Duration, label string, policyName string, agentID string, taskID string) (*Token, error) {
 	random := make([]byte, 16)
 	if _, err := rand.Read(random); err != nil {
 		return nil, fmt.Errorf("generating random bytes: %w", err)
@@ -74,6 +76,8 @@ func (s *Store) Issue(credentialID string, allowedDestinations []string, ttl tim
 		CredentialID:        credentialID,
 		AllowedDestinations: allowedDestinations,
 		PolicyName:          policyName,
+		AgentID:             agentID,
+		TaskID:              taskID,
 		CreatedAt:           now,
 		ExpiresAt:           now.Add(ttl),
 		Label:               label,
@@ -110,6 +114,21 @@ func (s *Store) Revoke(tokenValue string) bool {
 	}
 	t.Revoked = true
 	return true
+}
+
+// RevokeByTaskID revokes all tokens for a given task. Returns the count revoked.
+func (s *Store) RevokeByTaskID(taskID string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	count := 0
+	for _, t := range s.tokens {
+		if t.TaskID == taskID && !t.Revoked {
+			t.Revoked = true
+			count++
+		}
+	}
+	return count
 }
 
 func (s *Store) List() []*Token {
