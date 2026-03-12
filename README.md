@@ -508,11 +508,34 @@ spec:
 
 KeyFence supports global destination lists evaluated before token resolution.
 
+Lists can be loaded from files (one entry per line, `#` comments supported) or passed inline:
+
 ```bash
+# File-based (recommended — mount as a ConfigMap in Kubernetes)
+keyfence \
+  --deny-file /etc/keyfence/deny.txt \
+  --allow-without-token-file /etc/keyfence/allow-no-token.txt
+
+# Inline (for quick testing)
 keyfence \
   --deny ".pastebin.com,169.254.169.254,.ngrok.io" \
   --allow-without-token "pypi.org,registry.npmjs.org"
 ```
+
+Example deny file:
+
+```
+# Block exfiltration targets
+.pastebin.com
+.ngrok.io
+.requestbin.com
+
+# Block cloud metadata endpoints
+169.254.169.254
+metadata.google.internal
+```
+
+File and inline entries can be combined — they are merged at startup.
 
 ### Deny list
 
