@@ -304,6 +304,44 @@ else
     fail "test 11: expected upstream response, got $STATUS"
 fi
 
+# --- Test 12: Per-token rate limiting ---
+info "test 12: per-token rate limit (2 req/60s)"
+RATE_TOKEN=$(curl -sf -X POST http://localhost:10212/tokens \
+    -d "{\"credential\":\"$CRED\",\"destinations\":[\"api.anthropic.com\"],\"ttl_seconds\":60,\"rate_limit\":2,\"rate_window_seconds\":60}" | \
+    python3 -c "import sys,json; print(json.load(sys.stdin)['token'])")
+
+# First two requests should succeed (200 or 401 from upstream)
+for i in 1 2; do
+    STATUS=$(curl -s -o /dev/null -w '%{http_code}' \
+        --proxy http://127.0.0.1:10210 \
+        --cacert "$CA_CERT" \
+        https://api.anthropic.com/v1/messages \
+        -H "Content-Type: application/json" \
+        -H "x-api-key: $RATE_TOKEN" \
+        -H "anthropic-version: 2023-06-01" \
+        -d '{"model":"claude-sonnet-4-20250514","max_tokens":5,"messages":[{"role":"user","content":"hi"}]}')
+    if [ "$STATUS" = "429" ]; then
+        fail "test 12: request $i should not be rate-limited, got 429"
+        break
+    fi
+done
+
+# Third request should be rate-limited → 429
+STATUS=$(curl -s -o /dev/null -w '%{http_code}' \
+    --proxy http://127.0.0.1:10210 \
+    --cacert "$CA_CERT" \
+    https://api.anthropic.com/v1/messages \
+    -H "Content-Type: application/json" \
+    -H "x-api-key: $RATE_TOKEN" \
+    -H "anthropic-version: 2023-06-01" \
+    -d '{"model":"claude-sonnet-4-20250514","max_tokens":5,"messages":[{"role":"user","content":"hi"}]}')
+
+if [ "$STATUS" = "429" ]; then
+    pass "test 12: per-token rate limit enforced (429 on 3rd request)"
+else
+    fail "test 12: expected 429, got $STATUS"
+fi
+
 echo ""
 echo "========================================="
 if [ "$FAILURES" -eq 0 ]; then

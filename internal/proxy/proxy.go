@@ -170,6 +170,23 @@ func (p *Proxy) processRequest(clientConn net.Conn, req *http.Request, targetHos
 		return
 	}
 
+	// Per-token rate limit (set by operator at issuance)
+	if token.RateLimit > 0 && !p.store.CheckRate(tokenValue) {
+		p.audit.Log(audit.Entry{
+			Event:       audit.EventDeny,
+			TokenID:     token.ID,
+			AgentID:     token.AgentID,
+			TaskID:      token.TaskID,
+			Destination: targetHost,
+			Method:      req.Method,
+			Path:        req.URL.Path,
+			DenyRule:    "rate_limit",
+			DenyReason:  fmt.Sprintf("token rate limit exceeded: %d per %s", token.RateLimit, token.RateWindow),
+		})
+		writeError(clientConn, 429, fmt.Sprintf("rate limit exceeded: %d requests per %s", token.RateLimit, token.RateWindow))
+		return
+	}
+
 	// Check destination
 	if !token.IsDestinationAllowed(targetHost) {
 		p.audit.Log(audit.Entry{

@@ -22,13 +22,19 @@ type Token struct {
 	CredentialID        string   // reference into credential backend
 	AllowedDestinations []string // hosts this token can be used against
 	PolicyName          string   // optional policy to evaluate on each request
-	AgentID             string   // orchestrator-assigned agent identity
-	TaskID              string   // orchestrator-assigned task scope
+	AgentID             string        // orchestrator-assigned agent identity
+	TaskID              string        // orchestrator-assigned task scope
+	RateLimit           int           // max requests per window; 0 = unlimited
+	RateWindow          time.Duration // window duration
 	CreatedAt           time.Time
 	ExpiresAt           time.Time
 	Label               string // optional human-readable label
 	RenewalSeq          int
 	Revoked             bool
+
+	// rate tracking (internal)
+	rateCount int
+	rateStart time.Time
 }
 
 func (t *Token) IsValid() bool {
@@ -61,7 +67,20 @@ func New() *Store {
 	}
 }
 
-func (s *Store) Issue(credentialID string, allowedDestinations []string, ttl time.Duration, label string, policyName string, agentID string, taskID string) (*Token, error) {
+// IssueParams holds all parameters for token issuance.
+type IssueParams struct {
+	CredentialID        string
+	AllowedDestinations []string
+	TTL                 time.Duration
+	Label               string
+	PolicyName          string
+	AgentID             string
+	TaskID              string
+	RateLimit           int
+	RateWindow          time.Duration
+}
+
+func (s *Store) Issue(p IssueParams) (*Token, error) {
 	random := make([]byte, 16)
 	if _, err := rand.Read(random); err != nil {
 		return nil, fmt.Errorf("generating random bytes: %w", err)
@@ -73,14 +92,16 @@ func (s *Store) Issue(credentialID string, allowedDestinations []string, ttl tim
 	token := &Token{
 		ID:                  hex.EncodeToString(random[:8]),
 		Value:               value,
-		CredentialID:        credentialID,
-		AllowedDestinations: allowedDestinations,
-		PolicyName:          policyName,
-		AgentID:             agentID,
-		TaskID:              taskID,
+		CredentialID:        p.CredentialID,
+		AllowedDestinations: p.AllowedDestinations,
+		PolicyName:          p.PolicyName,
+		AgentID:             p.AgentID,
+		TaskID:              p.TaskID,
+		RateLimit:           p.RateLimit,
+		RateWindow:          p.RateWindow,
 		CreatedAt:           now,
-		ExpiresAt:           now.Add(ttl),
-		Label:               label,
+		ExpiresAt:           now.Add(p.TTL),
+		Label:               p.Label,
 	}
 
 	s.mu.Lock()
@@ -140,6 +161,32 @@ func (s *Store) List() []*Token {
 		result = append(result, t)
 	}
 	return result
+}
+
+// CheckRate evaluates the token's per-token rate limit.
+// Returns true if the request is allowed, false if rate-limited.
+// A token with RateLimit <= 0 always allows.
+func (s *Store) CheckRate(tokenValue string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	t, ok := s.tokens[tokenValue]
+	if !ok {
+		return false
+	}
+	if t.RateLimit <= 0 {
+		return true
+	}
+
+	now := time.Now()
+	if t.rateStart.IsZero() || now.Sub(t.rateStart) >= t.RateWindow {
+		t.rateCount = 1
+		t.rateStart = now
+		return true
+	}
+
+	t.rateCount++
+	return t.rateCount <= t.RateLimit
 }
 
 // Cleanup removes expired and revoked tokens.
