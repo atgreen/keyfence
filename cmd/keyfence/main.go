@@ -55,6 +55,7 @@ func main() {
 	dataDir := flag.String("data-dir", defaultDataDir(), "data directory for CA certs")
 	certsDir := flag.String("certs-dir", "", "directory to export CA cert for agents (optional)")
 	dlpMaxBytes := flag.Int("dlp-max-bytes", 1048576, "max request body size for DLP scanning")
+	apiKey := flag.String("api-key", "", "require this Bearer token on all control API requests (strongly recommended)")
 	flag.Parse()
 
 	// Load or create local CA
@@ -111,13 +112,19 @@ func main() {
 		}
 	}()
 
+	if *apiKey == "" {
+		log.Printf("WARNING: --api-key not set. The control API is unauthenticated.")
+		log.Printf("WARNING: Any process that can reach :10212 can issue and revoke tokens.")
+		log.Printf("WARNING: Set --api-key in production to prevent agent access to the control plane.")
+	}
+
 	// Token management API
 	mux := http.NewServeMux()
-	mux.HandleFunc("POST /tokens", handleIssueToken(store, creds, auditLog))
-	mux.HandleFunc("GET /tokens", handleListTokens(store))
-	mux.HandleFunc("DELETE /tokens/{token}", handleRevokeToken(store, auditLog))
-	mux.HandleFunc("DELETE /tasks/{task_id}/tokens", handleRevokeByTask(store, auditLog))
-	mux.HandleFunc("GET /policies", handleListPolicies(pol))
+	mux.HandleFunc("POST /tokens", requireAPIKey(*apiKey, handleIssueToken(store, creds, auditLog)))
+	mux.HandleFunc("GET /tokens", requireAPIKey(*apiKey, handleListTokens(store)))
+	mux.HandleFunc("DELETE /tokens/{token}", requireAPIKey(*apiKey, handleRevokeToken(store, auditLog)))
+	mux.HandleFunc("DELETE /tasks/{task_id}/tokens", requireAPIKey(*apiKey, handleRevokeByTask(store, auditLog)))
+	mux.HandleFunc("GET /policies", requireAPIKey(*apiKey, handleListPolicies(pol)))
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
@@ -306,6 +313,22 @@ func handleRevokeByTask(store *tokenstore.Store, auditLog *audit.Logger) http.Ha
 		})
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]interface{}{"status": "revoked", "count": count})
+	}
+}
+
+// requireAPIKey wraps a handler to require a Bearer token on the control API.
+// If key is empty, authentication is disabled (development mode).
+func requireAPIKey(key string, next http.HandlerFunc) http.HandlerFunc {
+	if key == "" {
+		return next
+	}
+	expected := "Bearer " + key
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != expected {
+			http.Error(w, `{"error":"unauthorized: invalid or missing api key"}`, 401)
+			return
+		}
+		next(w, r)
 	}
 }
 

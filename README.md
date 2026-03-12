@@ -4,7 +4,7 @@
 
 ## The Problem
 
-AI agents need API keys, bot tokens, and signing credentials to do useful work. As agents gain autonomy — spawning subprocesses, running arbitrary tools, executing code from untrusted inputs — every credential in their environment becomes an exfiltration target.
+AI agents need API keys, bot tokens, and other bearer-style credentials to do useful work. As agents gain autonomy — spawning subprocesses, running arbitrary tools, executing code from untrusted inputs — every credential in their environment becomes an exfiltration target.
 
 The attack surface is broad:
 
@@ -19,7 +19,9 @@ Traditional secret management (Vault, 1Password, environment variables) solves t
 
 ## How KeyFence Works
 
-KeyFence is an egress-controlled credential broker. It sits between the agent and the internet. The agent never possesses real credentials — only short-lived, destination-locked opaque tokens (`kf_...`) that are worthless outside the proxy.
+KeyFence is an egress-controlled credential broker for bearer-style and header-based credentials (API keys, PATs, bot tokens). It sits between the agent and the internet as an HTTPS proxy. The agent never possesses real credentials — only short-lived, destination-locked opaque tokens (`kf_...`) that are worthless outside the proxy.
+
+> **Scope today:** KeyFence protects credentials that are carried in HTTP headers. Credentials that require local cryptographic operations (AWS SigV4 signing, JWT minting) are out of scope for v1 — see [What KeyFence Does Not Defend Against](#what-keyfence-does-not-defend-against).
 
 ```
 ┌──────────────────────────────────────┐
@@ -96,12 +98,30 @@ KEYFENCE_TOKEN=$TOKEN podman-compose run --rm agent
 
 The `docker-compose.yaml` puts the agent on an `internal: true` network with no default gateway. Replace the example agent service with your actual agent image.
 
+## Control API Authentication
+
+In a container deployment, the agent can reach KeyFence on the shared network. To prevent the agent from issuing or revoking tokens directly, set `--api-key`:
+
+```bash
+keyfence --api-key "$KEYFENCE_API_KEY" --data-dir /data --certs-dir /certs
+```
+
+All control API endpoints (except `/health`) require the key as a Bearer token:
+
+```bash
+curl -H "Authorization: Bearer $KEYFENCE_API_KEY" \
+  -X POST http://localhost:10212/tokens -d '...'
+```
+
+The agent does not have this key. Without `--api-key`, KeyFence logs a warning at startup.
+
 ## Token API
 
 ### Issue a token
 
 ```bash
-curl -X POST http://localhost:10212/tokens \
+curl -H "Authorization: Bearer $KEYFENCE_API_KEY" \
+  -X POST http://localhost:10212/tokens \
   -d '{
     "credential": "sk-ant-real-key",
     "destinations": ["api.anthropic.com"],
@@ -186,7 +206,7 @@ KeyFence is a single Go binary with no external dependencies.
 | Component | Description |
 |-----------|-------------|
 | **MITM Proxy** (`:10210`) | TLS-intercepting forward proxy. Handles CONNECT tunneling, token resolution, credential injection, policy evaluation, DLP scanning. |
-| **Control API** (`:10212`) | Token issuance, listing, revocation, health checks. Orchestrator-facing — not exposed to the agent. |
+| **Control API** (`:10212`) | Token issuance, listing, revocation, health checks. Orchestrator-facing. Protected by `--api-key` to prevent agent access (see below). |
 | **Credential Backend** | Tokens hold references, not raw secrets. The backend fetches the real credential on each request. |
 | **Local CA** | ECDSA P-256 CA generated at startup. Issues per-hostname certificates on the fly for TLS interception. |
 | **Policy Engine** | Per-request evaluation of method, path, rate limits, request budgets, body size, content type. |
