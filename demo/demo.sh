@@ -4,11 +4,10 @@
 #
 # This script shows:
 #   1. The agent only has a kf_ token, not the real PAT
-#   2. Direct internet access is blocked
-#   3. HTTPS through the proxy works (curl)
-#   4. gh CLI works through the proxy
-#   5. Non-allowed destinations are blocked
-#   6. Rate limiting enforcement
+#   2. HTTPS through the proxy works (curl)
+#   3. gh CLI works through the proxy
+#   4. Non-allowed destinations are blocked
+#   5. Rate limiting enforcement
 #
 set -euo pipefail
 
@@ -39,18 +38,8 @@ else
     fail "expected kf_ prefix"
 fi
 
-# ── 2. Direct internet is blocked ─────────────────────────────────────
-section "2. Direct internet access is blocked"
-
-info "trying: curl --noproxy '*' https://github.com"
-if curl -sf --max-time 3 --noproxy '*' https://github.com >/dev/null 2>&1; then
-    fail "direct internet access succeeded (should be blocked)"
-else
-    pass "direct internet blocked (agent-isolated network has no gateway)"
-fi
-
-# ── 3. curl through the proxy works ───────────────────────────────────
-section "3. HTTPS through the KeyFence proxy works"
+# ── 2. curl through the proxy works ───────────────────────────────────
+section "2. HTTPS through the KeyFence proxy works"
 
 info "trying: curl https://api.github.com/user"
 USER_JSON=$(curl -sf https://api.github.com/user \
@@ -64,8 +53,8 @@ else
     echo "   Response: $USER_JSON"
 fi
 
-# ── 4. gh CLI works through the proxy ─────────────────────────────────
-section "4. gh CLI works through the proxy"
+# ── 3. gh CLI works through the proxy ─────────────────────────────────
+section "3. gh CLI works through the proxy"
 
 info "trying: gh api /user"
 GH_JSON=$(gh api /user 2>&1) || true
@@ -87,8 +76,8 @@ else
     info "no repos returned (PAT may lack repo scope)"
 fi
 
-# ── 5. Non-allowed destinations are blocked ────────────────────────────
-section "5. Non-allowed destinations are blocked by token policy"
+# ── 4. Non-allowed destinations are blocked ────────────────────────────
+section "4. Non-allowed destinations are blocked by token policy"
 
 info "trying: curl https://api.openai.com/ (not in allowed destinations)"
 HTTP_CODE=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
@@ -100,11 +89,11 @@ else
     fail "expected 403, got $HTTP_CODE"
 fi
 
-# ── 6. Rate limiting ──────────────────────────────────────────────────
-section "6. Rate limiting"
+# ── 5. Rate limiting ──────────────────────────────────────────────────
+section "5. Rate limiting"
 
 info "the standard policy allows 1000 req/hour"
-info "to see rate limiting in action, you can issue a tighter token from the host:"
+info "to see rate limiting in action, issue a tighter token from the host:"
 echo ""
 echo "   # From the host (not inside this container):"
 echo '   curl -H "Authorization: Bearer $KEYFENCE_API_KEY" \'

@@ -1,30 +1,29 @@
 #!/usr/bin/env bash
 #
-# setup.sh — Start KeyFence + agent in a podman pod, issue a token,
-#             run the GitHub demo.
+# setup.sh — Start KeyFence + Claude Code in a podman pod, issue a token,
+#             launch Claude Code.
 #
 # Prerequisites:
-#   export GITHUB_TOKEN=ghp_your_real_pat_here
+#   export ANTHROPIC_API_KEY=sk-ant-...
 #
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
 
-POD_NAME="keyfence-github"
+POD_NAME="keyfence-claude"
 KEYFENCE_IMAGE="keyfence"
-AGENT_IMAGE="keyfence-github-agent"
+CLAUDE_IMAGE="keyfence-claude-code"
 
-# ── 1. Check GITHUB_TOKEN ───────────────────────────────────────────
-if [ -z "${GITHUB_TOKEN:-}" ]; then
-    echo "Error: GITHUB_TOKEN is not set."
+# ── 1. Check ANTHROPIC_API_KEY ───────────────────────────────────────
+if [ -z "${ANTHROPIC_API_KEY:-}" ]; then
+    echo "Error: ANTHROPIC_API_KEY is not set."
     echo ""
-    echo "Export your GitHub Personal Access Token before running this script:"
-    echo "  export GITHUB_TOKEN=ghp_your_real_pat_here"
+    echo "  export ANTHROPIC_API_KEY=sk-ant-..."
     echo "  ./setup.sh"
     exit 1
 fi
-echo "==> Real GITHUB_TOKEN detected (${GITHUB_TOKEN:0:8}...)"
+echo "==> Real ANTHROPIC_API_KEY detected (${ANTHROPIC_API_KEY:0:10}...)"
 
 # ── 2. Generate control API key ──────────────────────────────────────
 KEYFENCE_API_KEY="${KEYFENCE_API_KEY:-$(openssl rand -hex 16)}"
@@ -34,8 +33,8 @@ echo "==> Control API key: ${KEYFENCE_API_KEY:0:8}..."
 echo "==> Building KeyFence image..."
 podman build -t "$KEYFENCE_IMAGE" -f ../../Containerfile ../..
 
-echo "==> Building agent image..."
-podman build -t "$AGENT_IMAGE" -f Containerfile.agent .
+echo "==> Building Claude Code image..."
+podman build -t "$CLAUDE_IMAGE" -f Containerfile.claude .
 
 # ── 4. Create pod ────────────────────────────────────────────────────
 podman pod rm -f "$POD_NAME" 2>/dev/null || true
@@ -43,6 +42,7 @@ podman pod rm -f "$POD_NAME" 2>/dev/null || true
 echo "==> Creating pod $POD_NAME..."
 podman pod create --name "$POD_NAME" -p 10212:10212
 
+# Shared volume for CA cert (public cert only)
 podman volume rm "${POD_NAME}-certs" 2>/dev/null || true
 podman volume create "${POD_NAME}-certs"
 
@@ -69,14 +69,15 @@ done
 echo "==> KeyFence is healthy."
 
 # ── 6. Issue a token ─────────────────────────────────────────────────
-echo "==> Issuing token locked to github.com + api.github.com (1 hour TTL)..."
+echo "==> Issuing token locked to api.anthropic.com (1 hour TTL)..."
 TOKEN_RESPONSE=$(curl -sf -X POST http://localhost:10212/tokens \
     -H "Authorization: Bearer ${KEYFENCE_API_KEY}" \
     -H "Content-Type: application/json" \
     -d '{
-        "credential": "'"${GITHUB_TOKEN}"'",
-        "destinations": ["github.com", "api.github.com"],
-        "ttl_seconds": 3600
+        "credential": "'"${ANTHROPIC_API_KEY}"'",
+        "destinations": ["api.anthropic.com"],
+        "ttl_seconds": 3600,
+        "label": "claude-code-agent"
     }')
 
 KEYFENCE_TOKEN=$(echo "$TOKEN_RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin)['token'])")
@@ -88,21 +89,22 @@ if [ -z "$KEYFENCE_TOKEN" ]; then
 fi
 
 echo "==> Token issued: ${KEYFENCE_TOKEN:0:20}..."
-echo "    Locked to: github.com, api.github.com"
+echo "    Destination: api.anthropic.com"
 echo "    TTL: 1 hour"
 echo ""
 
-# ── 7. Run the agent ─────────────────────────────────────────────────
-echo "==> Launching agent container..."
-echo "    The real GitHub PAT stays inside KeyFence."
-echo "    The agent only sees the kf_ token."
+# ── 7. Launch Claude Code ────────────────────────────────────────────
+echo "==> Launching Claude Code..."
+echo "    The real Anthropic API key stays inside KeyFence."
+echo "    Claude Code only sees the kf_ token."
 echo ""
 
-podman run -it --rm --pod "$POD_NAME" --name "${POD_NAME}-agent" \
+podman run -it --rm --pod "$POD_NAME" --name "${POD_NAME}-claude" \
     -e "HTTPS_PROXY=http://127.0.0.1:10210" \
+    -e "HTTP_PROXY=http://127.0.0.1:10210" \
     -e "SSL_CERT_FILE=/certs/ca.pem" \
-    -e "GIT_SSL_CAINFO=/certs/ca.pem" \
-    -e "GITHUB_TOKEN=${KEYFENCE_TOKEN}" \
-    -e "GH_HOST=github.com" \
+    -e "NODE_EXTRA_CA_CERTS=/certs/ca.pem" \
+    -e "ANTHROPIC_API_KEY=${KEYFENCE_TOKEN}" \
     -v "${POD_NAME}-certs:/certs:ro" \
-    "$AGENT_IMAGE"
+    "$CLAUDE_IMAGE" \
+    claude --dangerously-skip-permissions

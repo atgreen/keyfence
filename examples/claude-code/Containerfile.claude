@@ -1,0 +1,19 @@
+# SPDX-License-Identifier: MIT
+#
+# Claude Code agent container.
+# Uses node:20-slim (not Alpine) for glibc compatibility.
+
+FROM docker.io/node:20-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    curl \
+    git \
+    openssh-client \
+    jq \
+  && rm -rf /var/lib/apt/lists/*
+
+# Install Claude Code CLI
+RUN npm install -g @anthropic-ai/claude-code
+
+WORKDIR /workspace

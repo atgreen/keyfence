@@ -11,7 +11,7 @@ KeyFence is a single-binary proxy that sits between AI agents and the services t
 - **Rotate credentials without disruption** — swap the underlying secret and all tokens pick up the new value on their next request. No reissuance needed.
 - **Tunnel any protocol** — forward postgres, gRPC, or any TCP traffic through the KeyFence proxy with destination enforcement.
 - **Monitor everything in real-time** — structured audit logs, Server-Sent Events stream, webhook delivery, and OpenTelemetry distributed tracing on every request.
-- **Enforce egress at the network level** — containerized agents run on an isolated network with no internet access. All traffic must transit KeyFence.
+- **Deploy as a sidecar** — run KeyFence alongside your agent in a podman pod or Kubernetes sidecar. Agents reach the proxy at localhost.
 
 ## The Problem
 
@@ -30,7 +30,7 @@ Traditional secret management (Vault, 1Password, environment variables) solves t
 
 ## How KeyFence Works
 
-KeyFence is an egress-controlled credential containment proxy for bearer tokens, Basic auth, mTLS client certificates, and SSH keys. It sits between the agent and the internet as an HTTPS proxy and SSH bastion. The agent never possesses real credentials — only short-lived, destination-locked opaque tokens (`kf_...`) that are worthless outside KeyFence.
+KeyFence is a credential containment proxy for bearer tokens, Basic auth, mTLS client certificates, and SSH keys. It sits between the agent and the internet as an HTTPS proxy and SSH bastion. The agent never possesses real credentials — only short-lived, destination-locked opaque tokens (`kf_...`) that are worthless outside KeyFence.
 
 ### Supported credential types
 
@@ -49,11 +49,10 @@ KeyFence is an egress-controlled credential containment proxy for bearer tokens,
 │  Agent Container                     │
 │                                      │
 │  ANTHROPIC_API_KEY=kf_a3f8b2c1...    │
-│  HTTPS_PROXY=http://keyfence:10210   │
+│  HTTPS_PROXY=http://127.0.0.1:10210  │
 │                                      │
-│  (no internet access)                │
 └──────────────┬───────────────────────┘
-               │ only allowed connection
+               │
                ▼
 ┌──────────────────────────────────────┐
 │  KeyFence                            │
@@ -73,7 +72,7 @@ KeyFence is an egress-controlled credential containment proxy for bearer tokens,
           api.anthropic.com
 ```
 
-The agent container runs on an isolated network with no default gateway. It can only reach KeyFence. All outbound HTTPS transits the proxy, and SSH git operations go through the SSH bastion. Non-proxied traffic is dropped at the network level.
+In the recommended deployment, KeyFence runs as a sidecar in a podman pod or Kubernetes pod. The agent reaches the proxy at `127.0.0.1:10210`. The agent never has real credentials — even if it bypasses the proxy, it has nothing valuable to exfiltrate.
 
 ## Quick Start
 
@@ -101,24 +100,43 @@ curl https://api.anthropic.com/v1/messages \
   -d '{"model":"claude-sonnet-4-20250514","max_tokens":64,"messages":[{"role":"user","content":"say hi"}]}'
 ```
 
-### Containerized (with egress enforcement)
+### Podman pod (sidecar)
 
-This is the recommended deployment. The agent container has no internet access — it can only reach KeyFence.
+This is the recommended deployment. KeyFence runs as a sidecar in a podman pod, sharing localhost with the agent.
 
 ```bash
+# Create pod and shared volume
+podman pod create --name kf -p 10212:10212
+podman volume create kf-certs
+
 # Start KeyFence
-podman-compose up -d keyfence
+podman run -d --pod kf --name kf-keyfence \
+    -v kf-certs:/certs \
+    keyfence --certs-dir /certs
 
 # Issue a token
 TOKEN=$(curl -sf -X POST http://localhost:10212/tokens \
   -d '{"credential":"sk-ant-your-real-key","destinations":["api.anthropic.com"],"ttl_seconds":300}' \
   | python3 -c "import sys,json; print(json.load(sys.stdin)['token'])")
 
-# Run the agent (isolated network, no direct internet)
-KEYFENCE_TOKEN=$TOKEN podman-compose run --rm agent
+# Run the agent
+podman run -it --rm --pod kf \
+    -e "HTTPS_PROXY=http://127.0.0.1:10210" \
+    -e "SSL_CERT_FILE=/certs/ca.pem" \
+    -e "ANTHROPIC_API_KEY=$TOKEN" \
+    -v kf-certs:/certs:ro \
+    your-agent-image
 ```
 
-The `docker-compose.yaml` puts the agent on an `internal: true` network with no default gateway. Replace the example agent service with your actual agent image.
+Containers in the pod share a network namespace, so the agent reaches KeyFence at `127.0.0.1`.
+
+### Worked examples
+
+| Example | Description |
+|---------|-------------|
+| [`examples/claude-code/`](examples/claude-code/) | Claude Code calling the Anthropic API through KeyFence |
+| [`examples/claude-github/`](examples/claude-github/) | Claude Code using a GitHub PAT through KeyFence |
+| [`demo/`](demo/) | Interactive demo with guided walkthrough |
 
 ## Control API Authentication
 
@@ -467,99 +485,6 @@ KeyFence is a single Go binary with minimal dependencies (`golang.org/x/crypto` 
 | **Lua Rule Engine** | Sandboxed Lua VM evaluates response rules against upstream JSON. Supports stateful accumulation (e.g., token usage budgets) and automatic revocation. |
 | **Webhooks / SSE** | Real-time audit event delivery via Server-Sent Events (`GET /events`) and registered webhook URLs. |
 | **Telemetry** | Optional OpenTelemetry distributed tracing. Configured via standard `OTEL_*` env vars. Silently disabled when no collector is reachable. |
-
-## Egress Enforcement
-
-Without egress enforcement, KeyFence is convenience, not containment. The agent could bypass the proxy and send credentials anywhere.
-
-The containerized deployment enforces egress at the network level:
-
-```yaml
-networks:
-  agent-isolated:
-    internal: true   # no default gateway — no internet access
-```
-
-The agent container can only reach KeyFence. All other outbound traffic — HTTP, DNS, raw TCP, UDP — is dropped. This is enforced by the container runtime, not by KeyFence, making it harder to bypass.
-
-For Kubernetes, use a NetworkPolicy:
-
-```yaml
-apiVersion: networking.k8s.io/v1
-kind: NetworkPolicy
-metadata:
-  name: agent-egress
-spec:
-  podSelector:
-    matchLabels:
-      role: agent
-  policyTypes: [Egress]
-  egress:
-    - to:
-        - podSelector:
-            matchLabels:
-              app: keyfence
-      ports:
-        - port: 10210
-        - port: 10211
-```
-
-## Global Allow/Deny Lists
-
-KeyFence supports global destination lists evaluated before token resolution.
-
-Lists can be loaded from files (one entry per line, `#` comments supported) or passed inline:
-
-```bash
-# File-based (recommended — mount as a ConfigMap in Kubernetes)
-keyfence \
-  --deny-file /etc/keyfence/deny.txt \
-  --allow-without-token-file /etc/keyfence/allow-no-token.txt
-
-# Inline (for quick testing)
-keyfence \
-  --deny ".pastebin.com,169.254.169.254,.ngrok.io" \
-  --allow-without-token "pypi.org,registry.npmjs.org"
-```
-
-Example deny file:
-
-```
-# Block exfiltration targets
-.pastebin.com
-.ngrok.io
-.requestbin.com
-
-# Block cloud metadata endpoints
-169.254.169.254
-metadata.google.internal
-```
-
-File and inline entries can be combined — they are merged at startup.
-
-### Deny list
-
-The deny list is a hard security boundary. Blocked destinations are rejected immediately — before TLS handshake, before token lookup, before any work. Even if a valid token exists for a denied destination, it cannot be used. Applied to both the HTTPS proxy and the SSH bastion.
-
-### Allow-without-token
-
-The allow-without-token list lets specific destinations bypass token requirements. This is useful for public endpoints like package registries that don't need credentials. Traffic is still logged but has no token attribution (no token_id, agent_id, or task_id on the audit entry).
-
-Use sparingly — any destination on this list is a potential exfiltration channel.
-
-### Domain matching
-
-Entries support a leading dot for subdomain matching:
-
-| Entry | Matches |
-|-------|---------|
-| `example.com` | `example.com` only |
-| `.example.com` | `example.com` and `*.example.com` |
-| `.pastebin.com/raw/*` | `pastebin.com/raw/...` and `*.pastebin.com/raw/...` |
-
-### Evaluation order
-
-Global deny list → allow-without-token → require token → per-token destination check → policy check → forward.
 
 ## Telemetry (OpenTelemetry)
 

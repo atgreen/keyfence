@@ -1,0 +1,14 @@
+# SPDX-License-Identifier: MIT
+FROM docker.io/alpine:3.20
+RUN apk add --no-cache bash curl git openssh-client jq
+# Install GitHub CLI from official tarball
+RUN set -eux; \
+    ARCH=$(uname -m); \
+    case "$ARCH" in \
+        x86_64)  GH_ARCH="linux_amd64" ;; \
+        aarch64) GH_ARCH="linux_arm64" ;; \
+        *) echo "unsupported arch: $ARCH" && exit 1 ;; \
+    esac; \
+    GH_VERSION="2.67.0"; \
+    curl -fsSL "https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_${GH_ARCH}.tar.gz" \
+        | tar -xz -C /usr/local --strip-components=1
