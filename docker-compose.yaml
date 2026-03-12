@@ -12,8 +12,9 @@
 #   1. Start KeyFence:
 #      podman-compose up -d keyfence
 #
-#   2. Issue a token:
+#   2. Issue a token (KEYFENCE_API_KEY authenticates to the control API):
 #      TOKEN=$(curl -sf -X POST http://localhost:10212/tokens \
+#        -H "Authorization: Bearer $KEYFENCE_API_KEY" \
 #        -d '{"credential":"sk-ant-your-real-key","destinations":["api.anthropic.com"],"ttl_seconds":300}' \
 #        | python3 -c "import sys,json; print(json.load(sys.stdin)['token'])")
 #
@@ -31,7 +32,7 @@ services:
     volumes:
       - keyfence-data:/data
       - keyfence-certs:/certs
-    command: ["--data-dir", "/data", "--certs-dir", "/certs"]
+    command: ["--data-dir", "/data", "--certs-dir", "/certs", "--api-key", "${KEYFENCE_API_KEY:?Set KEYFENCE_API_KEY to protect the control API}"]
     healthcheck:
       test: ["CMD", "wget", "-q", "--spider", "http://localhost:10212/health"]
       interval: 5s

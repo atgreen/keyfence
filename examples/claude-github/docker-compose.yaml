@@ -26,7 +26,7 @@ services:
     volumes:
       - keyfence-data:/data
       - keyfence-certs:/certs
-    command: ["--data-dir", "/data", "--certs-dir", "/certs"]
+    command: ["--data-dir", "/data", "--certs-dir", "/certs", "--api-key", "${KEYFENCE_API_KEY:?Set KEYFENCE_API_KEY}"]
     healthcheck:
       test: ["CMD", "wget", "-q", "--spider", "http://localhost:10212/health"]
       interval: 5s

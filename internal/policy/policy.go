@@ -104,7 +104,10 @@ func (e *Engine) Check(policyName string, tokenID string, req *http.Request) *De
 
 	p := e.Get(policyName)
 	if p == nil {
-		return nil // unknown policy = open
+		return &Deny{
+			Rule:    "unknown_policy",
+			Message: fmt.Sprintf("unknown policy %q", policyName),
+		}
 	}
 
 	if deny := p.checkMethod(req.Method); deny != nil {
