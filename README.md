@@ -1,6 +1,6 @@
 # KeyFence
 
-**If an AI agent can read a credential, that credential can be exfiltrated. KeyFence makes sure it never can.**
+**Credential containment for AI agents.**
 
 KeyFence is a single-binary proxy that sits between AI agents and the services they use. Agents never hold real credentials — only short-lived, scoped tokens that KeyFence resolves on each request. With KeyFence you can:
 
@@ -26,7 +26,7 @@ The attack surface is broad:
 
 Traditional secret management (Vault, 1Password, environment variables) solves the *storage* problem but not the *runtime* problem. Once a secret is loaded into the agent's process, it can be read and exfiltrated by anything the agent executes.
 
-**If the agent can read a secret value at all, you have already lost the exfiltration property.**
+**If an AI agent can read a credential, that credential can be exfiltrated. KeyFence makes sure it never can.**
 
 ## How KeyFence Works
 
