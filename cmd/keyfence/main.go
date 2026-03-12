@@ -158,13 +158,15 @@ func exportCACert(ca *proxy.CA, dir string) error {
 }
 
 type issueRequest struct {
-	Credential   string   `json:"credential"`
-	Destinations []string `json:"destinations"`
-	TTLSeconds   int      `json:"ttl_seconds"`
-	Label        string   `json:"label"`
-	Policy       string   `json:"policy"`
-	AgentID      string   `json:"agent_id"`
-	TaskID       string   `json:"task_id"`
+	Credential        string   `json:"credential"`
+	Destinations      []string `json:"destinations"`
+	TTLSeconds        int      `json:"ttl_seconds"`
+	Label             string   `json:"label"`
+	Policy            string   `json:"policy"`
+	AgentID           string   `json:"agent_id"`
+	TaskID            string   `json:"task_id"`
+	RateLimit         int      `json:"rate_limit"`
+	RateWindowSeconds int      `json:"rate_window_seconds"`
 }
 
 type issueResponse struct {
@@ -201,7 +203,19 @@ func handleIssueToken(store *tokenstore.Store, creds credstore.Backend, auditLog
 			ttl = 5 * time.Minute
 		}
 
-		token, err := store.Issue(credID, req.Destinations, ttl, req.Label, req.Policy, req.AgentID, req.TaskID)
+		rateWindow := time.Duration(req.RateWindowSeconds) * time.Second
+
+		token, err := store.Issue(tokenstore.IssueParams{
+			CredentialID:        credID,
+			AllowedDestinations: req.Destinations,
+			TTL:                 ttl,
+			Label:               req.Label,
+			PolicyName:          req.Policy,
+			AgentID:             req.AgentID,
+			TaskID:              req.TaskID,
+			RateLimit:           req.RateLimit,
+			RateWindow:          rateWindow,
+		})
 		if err != nil {
 			http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err), 500)
 			return
