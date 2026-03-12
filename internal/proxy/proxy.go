@@ -21,6 +21,7 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 
+	"github.com/keyfence/keyfence/internal/acl"
 	"github.com/keyfence/keyfence/internal/audit"
 	"github.com/keyfence/keyfence/internal/credstore"
 	"github.com/keyfence/keyfence/internal/luaengine"
@@ -51,10 +52,11 @@ type Proxy struct {
 	policy    *policy.Engine
 	audit     *audit.Logger
 	lua       *luaengine.Engine
+	acl       *acl.List
 	addr      string
 }
 
-func New(addr string, ca *CA, store *tokenstore.Store, creds credstore.Backend, certs *credstore.CertStore, pol *policy.Engine, auditLog *audit.Logger) *Proxy {
+func New(addr string, ca *CA, store *tokenstore.Store, creds credstore.Backend, certs *credstore.CertStore, pol *policy.Engine, auditLog *audit.Logger, aclList *acl.List) *Proxy {
 	return &Proxy{
 		ca:     ca,
 		store:  store,
@@ -63,6 +65,7 @@ func New(addr string, ca *CA, store *tokenstore.Store, creds credstore.Backend, 
 		policy: pol,
 		audit:  auditLog,
 		lua:    luaengine.New(),
+		acl:    aclList,
 		addr:   addr,
 	}
 }
@@ -119,6 +122,19 @@ func (p *Proxy) handleConnect(conn net.Conn, req *http.Request) {
 	)
 	defer span.End()
 
+	// Global deny list — reject before TLS handshake
+	if p.acl.IsDeniedHost(hostname) {
+		p.audit.Log(audit.Entry{
+			Event:       audit.EventDeny,
+			Destination: hostname,
+			DenyRule:    "acl_deny",
+			DenyReason:  fmt.Sprintf("destination %s is on the deny list", hostname),
+		})
+		span.SetStatus(codes.Error, "acl_deny")
+		writeConnectError(conn, 403, fmt.Sprintf("destination %s is blocked", hostname))
+		return
+	}
+
 	// Send 200 to establish tunnel
 	resp := &http.Response{
 		StatusCode: 200,
@@ -168,6 +184,44 @@ func (p *Proxy) processRequest(ctx context.Context, clientConn net.Conn, req *ht
 		),
 	)
 	defer span.End()
+
+	// Global deny list (path-level check)
+	if p.acl.IsDenied(targetHost, req.URL.Path) {
+		p.audit.Log(audit.Entry{
+			Event:       audit.EventDeny,
+			Destination: targetHost,
+			Method:      req.Method,
+			Path:        req.URL.Path,
+			DenyRule:    "acl_deny",
+			DenyReason:  fmt.Sprintf("destination %s%s is on the deny list", targetHost, req.URL.Path),
+		})
+		span.SetStatus(codes.Error, "acl_deny")
+		writeError(clientConn, 403, fmt.Sprintf("destination %s is blocked", targetHost))
+		return
+	}
+
+	// Global allow-without-token passthrough
+	if p.acl.IsAllowedWithoutToken(targetHost, req.URL.Path) {
+		p.audit.Log(audit.Entry{
+			Event:       audit.EventAllow,
+			Destination: targetHost,
+			Method:      req.Method,
+			Path:        req.URL.Path,
+			Label:       "passthrough (no token required)",
+		})
+		upstreamResp, err := p.forwardRequest(req, targetHost, nil)
+		if err != nil {
+			log.Printf("passthrough upstream error: %v", err)
+			writeError(clientConn, 502, fmt.Sprintf("upstream error: %v", err))
+			return
+		}
+		defer upstreamResp.Body.Close()
+		span.SetAttributes(attribute.Int("http.status_code", upstreamResp.StatusCode))
+		if err := upstreamResp.Write(clientConn); err != nil {
+			log.Printf("write response: %v", err)
+		}
+		return
+	}
 
 	// Find kf_ token in any header
 	tokenValue, tokenHeader := findToken(req)
@@ -550,6 +604,12 @@ func findToken(req *http.Request) (tokenValue, headerKey string) {
 		}
 	}
 	return "", ""
+}
+
+func writeConnectError(conn net.Conn, status int, message string) {
+	resp := fmt.Sprintf("HTTP/1.1 %d %s\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n%s",
+		status, http.StatusText(status), message)
+	conn.Write([]byte(resp))
 }
 
 func writeError(conn net.Conn, status int, message string) {

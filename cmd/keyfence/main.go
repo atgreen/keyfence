@@ -43,8 +43,10 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"time"
 
+	"github.com/keyfence/keyfence/internal/acl"
 	"github.com/keyfence/keyfence/internal/audit"
 	"github.com/keyfence/keyfence/internal/credstore"
 	"github.com/keyfence/keyfence/internal/policy"
@@ -61,6 +63,8 @@ func main() {
 	dataDir := flag.String("data-dir", defaultDataDir(), "data directory for CA certs")
 	certsDir := flag.String("certs-dir", "", "directory to export CA cert for agents (optional)")
 	apiKey := flag.String("api-key", "", "require this Bearer token on all control API requests (strongly recommended)")
+	denyList := flag.String("deny", "", "comma-separated deny list of destinations (e.g. .pastebin.com,169.254.169.254)")
+	allowNoToken := flag.String("allow-without-token", "", "comma-separated destinations that bypass token requirements (e.g. pypi.org,registry.npmjs.org)")
 	flag.Parse()
 
 	// Initialize OpenTelemetry (configured via OTEL_* env vars)
@@ -122,8 +126,18 @@ func main() {
 		AllowedMethods: []string{"GET", "HEAD"},
 	})
 
+	// Build global ACL
+	aclList := acl.New(splitCSV(*denyList), splitCSV(*allowNoToken))
+	if *denyList != "" {
+		log.Printf("deny list: %s", *denyList)
+	}
+	if *allowNoToken != "" {
+		log.Printf("WARNING: allow-without-token: %s", *allowNoToken)
+		log.Printf("WARNING: These destinations bypass token requirements. Use sparingly.")
+	}
+
 	// Start HTTPS proxy
-	p := proxy.New(*proxyAddr, ca, store, creds, certs, pol, auditLog)
+	p := proxy.New(*proxyAddr, ca, store, creds, certs, pol, auditLog, aclList)
 	go func() {
 		if err := p.ListenAndServe(); err != nil {
 			log.Fatalf("proxy: %v", err)
@@ -132,7 +146,7 @@ func main() {
 
 	// Start SSH bastion
 	sshDir := filepath.Join(*dataDir, "ssh")
-	sshServer, err := sshproxy.New(*sshAddr, sshDir, store, sshKeys, auditLog)
+	sshServer, err := sshproxy.New(*sshAddr, sshDir, store, sshKeys, auditLog, aclList)
 	if err != nil {
 		log.Fatalf("ssh: %v", err)
 	}
@@ -179,6 +193,21 @@ func main() {
 	if err := http.ListenAndServe(*apiAddr, mux); err != nil {
 		log.Fatalf("api: %v", err)
 	}
+}
+
+func splitCSV(s string) []string {
+	if s == "" {
+		return nil
+	}
+	parts := strings.Split(s, ",")
+	result := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			result = append(result, p)
+		}
+	}
+	return result
 }
 
 func defaultDataDir() string {

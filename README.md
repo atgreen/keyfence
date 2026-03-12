@@ -504,6 +504,40 @@ spec:
         - port: 10211
 ```
 
+## Global Allow/Deny Lists
+
+KeyFence supports global destination lists evaluated before token resolution.
+
+```bash
+keyfence \
+  --deny ".pastebin.com,169.254.169.254,.ngrok.io" \
+  --allow-without-token "pypi.org,registry.npmjs.org"
+```
+
+### Deny list
+
+The deny list is a hard security boundary. Blocked destinations are rejected immediately — before TLS handshake, before token lookup, before any work. Even if a valid token exists for a denied destination, it cannot be used. Applied to both the HTTPS proxy and the SSH bastion.
+
+### Allow-without-token
+
+The allow-without-token list lets specific destinations bypass token requirements. This is useful for public endpoints like package registries that don't need credentials. Traffic is still logged but has no token attribution (no token_id, agent_id, or task_id on the audit entry).
+
+Use sparingly — any destination on this list is a potential exfiltration channel.
+
+### Domain matching
+
+Entries support a leading dot for subdomain matching:
+
+| Entry | Matches |
+|-------|---------|
+| `example.com` | `example.com` only |
+| `.example.com` | `example.com` and `*.example.com` |
+| `.pastebin.com/raw/*` | `pastebin.com/raw/...` and `*.pastebin.com/raw/...` |
+
+### Evaluation order
+
+Global deny list → allow-without-token → require token → per-token destination check → policy check → forward.
+
 ## Telemetry (OpenTelemetry)
 
 KeyFence emits distributed traces via OpenTelemetry. Every proxy request and SSH session gets a trace span with token ID, agent ID, task ID, destination, and outcome.

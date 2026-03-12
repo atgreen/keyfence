@@ -25,6 +25,7 @@ internal/policy/policy.go      Policy engine (methods, paths, rate limits, budge
 internal/sshproxy/sshproxy.go  SSH bastion (TCP forwarding, SSH key injection)
 internal/luaengine/engine.go   Sandboxed Lua VM pool for response rule evaluation
 internal/luaengine/convert.go  Go/Lua bidirectional type conversion
+internal/acl/acl.go            Global allow/deny list for destinations
 internal/telemetry/telemetry.go OpenTelemetry tracing initialization
 internal/audit/audit.go        Structured JSON audit logging + sink fan-out
 internal/audit/webhook.go      Webhook sink (async delivery, HMAC signing)
@@ -81,6 +82,9 @@ and 401s from Anthropic are expected and accepted.
 - SSH bastion authenticates agents with kf_ tokens. Two modes:
   - TCP forwarding (direct-tcpip): any protocol, destination-enforced, bytes untouched.
   - SSH key injection (session exec): KeyFence holds real SSH key, bridges session upstream.
+- Global deny list (`--deny`) blocks destinations before token resolution.
+  Global allow-without-token (`--allow-without-token`) bypasses token requirements.
+  Both support `.domain.com` subdomain matching and host+path entries.
 - Destinations support host-only (`api.example.com`) or host+path (`api.example.com/v1/*`)
   with glob matching. Fully backward compatible.
 - Credentials can be rotated via `PUT /credentials/{id}` without invalidating tokens.
