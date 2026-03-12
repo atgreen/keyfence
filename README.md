@@ -2,9 +2,20 @@
 
 **Credential containment for AI agents.**
 
+KeyFence is a single-binary proxy that sits between AI agents and the services they use. Agents never hold real credentials — only short-lived, scoped tokens that KeyFence resolves on each request. With KeyFence you can:
+
+- **Protect any credential type** — API keys, Bearer tokens, Basic auth, mTLS client certificates, and SSH private keys. Agents use opaque `kf_` tokens; real secrets never enter the agent's address space.
+- **Lock tokens to specific hosts and paths** — a token for `api.anthropic.com/v1/messages` cannot be used against any other host or endpoint.
+- **Enforce policies** — restrict HTTP methods, content types, body sizes, and rate limits per token.
+- **Set usage budgets with Lua scripting** — attach Lua scripts that inspect upstream JSON responses, accumulate metrics like LLM token usage across requests, and automatically revoke a token when a budget is exceeded.
+- **Rotate credentials without disruption** — swap the underlying secret and all tokens pick up the new value on their next request. No reissuance needed.
+- **Tunnel any protocol** — forward postgres, gRPC, or any TCP traffic through the SSH bastion with destination enforcement.
+- **Monitor everything in real-time** — structured audit logs, Server-Sent Events stream, webhook delivery, and OpenTelemetry distributed tracing on every request.
+- **Enforce egress at the network level** — containerized agents run on an isolated network with no internet access. All traffic must transit KeyFence.
+
 ## The Problem
 
-AI agents need API keys, bot tokens, and other bearer-style credentials to do useful work. As agents gain autonomy — spawning subprocesses, running arbitrary tools, executing code from untrusted inputs — every credential in their environment becomes an exfiltration target.
+AI agents need API keys, bot tokens, SSH keys, and other credentials to do useful work. As agents gain autonomy — spawning subprocesses, running arbitrary tools, executing code from untrusted inputs — every credential in their environment becomes an exfiltration target.
 
 The attack surface is broad:
 
@@ -19,7 +30,7 @@ Traditional secret management (Vault, 1Password, environment variables) solves t
 
 ## How KeyFence Works
 
-KeyFence is an egress-controlled credential containment proxy for bearer tokens, Basic auth, and mTLS client certificates. It sits between the agent and the internet as an HTTPS proxy. The agent never possesses real credentials — only short-lived, destination-locked opaque tokens (`kf_...`) that are worthless outside the proxy.
+KeyFence is an egress-controlled credential containment proxy for bearer tokens, Basic auth, mTLS client certificates, and SSH keys. It sits between the agent and the internet as an HTTPS proxy and SSH bastion. The agent never possesses real credentials — only short-lived, destination-locked opaque tokens (`kf_...`) that are worthless outside KeyFence.
 
 ### Supported credential types
 
@@ -28,8 +39,10 @@ KeyFence is an egress-controlled credential containment proxy for bearer tokens,
 | **Bearer / API keys** | Token found in any header value, swapped for real credential |
 | **Basic auth** | Token found inside Base64-decoded `Authorization: Basic` header |
 | **Client certificates** | KeyFence presents the cert+key on the upstream TLS handshake; agent never has the private key |
+| **SSH keys** | Agent authenticates to KeyFence's SSH bastion with a `kf_` token; KeyFence connects upstream with the real SSH key |
+| **TCP forwarding** | Agent tunnels any protocol (postgres, gRPC, etc.) through the SSH bastion; KeyFence enforces destination policy |
 
-> **Scope today:** KeyFence protects credentials carried in HTTP headers and client certificates presented at the TLS layer. Credentials that require local cryptographic operations (AWS SigV4 signing, JWT minting) are out of scope for v1 — see [What KeyFence Does Not Defend Against](#what-keyfence-does-not-defend-against).
+> **Scope today:** KeyFence protects credentials carried in HTTP headers, client certificates presented at the TLS layer, and SSH private keys. Credentials that require local cryptographic operations (AWS SigV4 signing, JWT minting) are out of scope for v1 — see [What KeyFence Does Not Defend Against](#what-keyfence-does-not-defend-against).
 
 ```
 ┌──────────────────────────────────────┐
@@ -60,7 +73,7 @@ KeyFence is an egress-controlled credential containment proxy for bearer tokens,
           api.anthropic.com
 ```
 
-The agent container runs on an isolated network with no default gateway. It can only reach KeyFence. All outbound HTTPS transits the proxy. Non-HTTP traffic is dropped at the network level.
+The agent container runs on an isolated network with no default gateway. It can only reach KeyFence. All outbound HTTPS transits the proxy, and SSH git operations go through the SSH bastion. Non-proxied traffic is dropped at the network level.
 
 ## Quick Start
 
@@ -174,7 +187,7 @@ curl http://localhost:10212/policies
 | Property | Description |
 |----------|-------------|
 | **Short-lived** | Configurable TTL (default 5 minutes). Expired tokens are rejected. |
-| **Destination-locked** | Only resolved when the request targets an allowed host. A token for `api.anthropic.com` cannot be used against `api.openai.com`. |
+| **Destination-locked** | Only resolved when the request targets an allowed host and path. A token for `api.anthropic.com/v1/*` cannot be used against other hosts or paths. |
 | **Policy-bound** | Optional policy restricts HTTP methods, paths, rate limits, body size, and content types. |
 | **Revocable** | Instant invalidation without rotating the underlying credential. |
 | **Opaque** | The agent never sees the real credential. Even if the token leaks, it's expired and destination-locked. |
@@ -194,6 +207,162 @@ Tokens can be issued with a named policy that restricts what the token is allowe
 # Issue a readonly token — agent can list models but not create completions
 curl -X POST http://localhost:10212/tokens \
   -d '{"credential":"sk-ant-key","destinations":["api.anthropic.com"],"policy":"readonly"}'
+```
+
+## Destination Path Scoping
+
+Destinations can include URL path restrictions, not just hostnames. This lets you lock a token to specific API endpoints.
+
+```bash
+# Host only — matches all paths (existing behavior)
+"destinations": ["api.anthropic.com"]
+
+# Exact path
+"destinations": ["api.anthropic.com/v1/messages"]
+
+# Path glob — matches /v1/messages, /v1/models, etc.
+"destinations": ["api.anthropic.com/v1/*"]
+```
+
+The first `/` in a destination entry separates the host from the path pattern. Host-only entries match all paths (fully backward compatible). Path patterns support glob matching with `/*` for subtree wildcards.
+
+```bash
+# Token that can only call Anthropic's messages endpoint
+curl -X POST http://localhost:10212/tokens \
+  -d '{"credential":"sk-ant-key","destinations":["api.anthropic.com/v1/messages"]}'
+```
+
+SSH bastion (TCP forwarding) destinations are host-only — path scoping applies to HTTPS proxy requests.
+
+## Credential Rotation
+
+Credentials can be rotated without invalidating tokens. All tokens referencing a credential pick up the new value on their next request.
+
+```bash
+# Rotate a header credential (the credential_id comes from token issuance)
+curl -H "Authorization: Bearer $KEYFENCE_API_KEY" \
+  -X PUT http://localhost:10212/credentials/cred_1 \
+  -d '{"credential":"sk-ant-new-rotated-key"}'
+```
+
+Response:
+```json
+{"status": "rotated", "credential_id": "cred_1", "affected_tokens": 3}
+```
+
+Client certificates and SSH keys can also be rotated:
+
+```bash
+# Rotate a client certificate
+curl -H "Authorization: Bearer $KEYFENCE_API_KEY" \
+  -X PUT http://localhost:10212/credentials/cert_1/cert \
+  -d '{"client_cert":"-----BEGIN CERTIFICATE-----\n...", "client_key":"-----BEGIN EC PRIVATE KEY-----\n..."}'
+
+# Rotate an SSH key
+curl -H "Authorization: Bearer $KEYFENCE_API_KEY" \
+  -X PUT http://localhost:10212/credentials/sshkey_1/sshkey \
+  -d '{"ssh_private_key":"...", "ssh_username":"git"}'
+```
+
+This works because tokens hold credential references (IDs), not raw values. The credential backend resolves the ID to the current value on each request. Rotation is atomic and takes effect immediately.
+
+## Webhooks and Event Stream
+
+KeyFence can push audit events to webhook URLs and stream them in real-time via Server-Sent Events.
+
+### SSE event stream
+
+Connect to the `/events` endpoint for a real-time stream of all audit events:
+
+```bash
+curl -N -H "Authorization: Bearer $KEYFENCE_API_KEY" \
+  http://localhost:10212/events
+```
+
+Events arrive as `data: {...}\n\n` in standard SSE format. Each event is a JSON audit entry with fields like `event`, `token_id`, `agent_id`, `destination`, etc.
+
+### Webhooks
+
+Register a webhook to receive audit events via HTTP POST:
+
+```bash
+curl -H "Authorization: Bearer $KEYFENCE_API_KEY" \
+  -X POST http://localhost:10212/webhooks \
+  -d '{
+    "url": "https://ops.example.com/keyfence-events",
+    "secret": "my-signing-key",
+    "events": ["deny", "revoke", "response_rule"]
+  }'
+```
+
+If `secret` is set, each delivery includes an `X-KeyFence-Signature` header (HMAC-SHA256 of the body). The `events` filter is optional — omit it to receive all events. Delivery is async with retry (3 attempts, exponential backoff).
+
+## Response Rules (Lua scripting)
+
+Tokens can carry Lua scripts that are evaluated against each upstream JSON response. This enables automatic token revocation based on API response data — for example, revoking a token when cumulative LLM token usage exceeds a budget.
+
+```bash
+# Issue a token with a usage budget
+curl -H "Authorization: Bearer $KEYFENCE_API_KEY" \
+  -X POST http://localhost:10212/tokens \
+  -d '{
+    "credential": "sk-ant-key",
+    "destinations": ["api.anthropic.com/v1/*"],
+    "ttl_seconds": 3600,
+    "response_rules": [{
+      "script": "state.total = (state.total or 0) + (response.usage and response.usage.output_tokens or 0)\nif state.total > 50000 then return {action=\"revoke\", reason=\"budget exceeded: \" .. state.total} end"
+    }]
+  }'
+```
+
+### How it works
+
+1. The proxy forwards the request to upstream and tees the response — the client receives it immediately with no added latency
+2. After the response completes, if `Content-Type` is `application/json`, the buffered copy is parsed and injected into a sandboxed Lua VM as the `response` table
+3. Each Lua script runs with access to:
+   - `response` — the parsed JSON response body
+   - `response_headers` — HTTP response headers
+   - `response_status` — HTTP status code
+   - `state` — a mutable table persisted across requests for this token
+4. Scripts return `nil` (no action) or a table like `{action="revoke", reason="..."}`
+
+### Actions
+
+| Action | Effect |
+|--------|--------|
+| `revoke` | Immediately revokes the token. The current response is delivered, but the next request will fail. |
+| `alert` | Fires an audit event (propagated to webhooks and SSE stream). Token remains valid. |
+
+### SSE streaming support
+
+For LLM streaming responses (`text/event-stream`), KeyFence captures the last SSE `data:` line — which is where Anthropic, OpenAI, and other APIs report usage — and evaluates Lua scripts against it. The stream is forwarded to the client in real-time with zero added latency.
+
+### Sandbox
+
+Lua scripts run in a sandboxed VM with no filesystem, network, or OS access. Dangerous functions (`os`, `io`, `require`, `load`, `debug`) are removed. Scripts are terminated after 500ms or 100,000 instructions to prevent infinite loops. Script errors never affect response delivery.
+
+### Examples
+
+```lua
+-- Revoke when cumulative output tokens exceed 50k
+state.total = (state.total or 0) + (response.usage and response.usage.output_tokens or 0)
+if state.total > 50000 then
+  return {action = "revoke", reason = "budget exceeded: " .. state.total}
+end
+```
+
+```lua
+-- Alert on errors from upstream
+if response.error then
+  return {action = "alert", reason = "upstream error: " .. (response.error.message or "unknown")}
+end
+```
+
+```lua
+-- Revoke if upstream says the key is invalid (don't keep hammering a dead key)
+if response.error and response.error.type == "authentication_error" then
+  return {action = "revoke", reason = "upstream auth failed"}
+end
 ```
 
 ## Client Certificates (mTLS)
@@ -228,17 +397,76 @@ curl -X POST http://localhost:10212/tokens \
 
 A token can carry both a header credential and a client certificate, or either one alone.
 
+## SSH Bastion (TCP forwarding and SSH key injection)
+
+KeyFence includes an SSH bastion on `:10211`. The agent authenticates with a `kf_` token as the SSH password. The bastion serves two purposes:
+
+1. **TCP forwarding** — tunnel any protocol to allowed destinations. KeyFence enforces destination policy but doesn't touch the bytes. No SSH key needed on the token.
+2. **SSH key injection** — for SSH-based upstreams (git, etc.), KeyFence holds the real private key and authenticates upstream. The agent never has the key.
+
+### TCP forwarding (any protocol)
+
+Forward a postgres connection through KeyFence:
+
+```bash
+# Issue a token (no SSH key needed for TCP forwarding)
+curl -H "Authorization: Bearer $KEYFENCE_API_KEY" \
+  -X POST http://localhost:10212/tokens \
+  -d '{"credential":"unused","destinations":["db.internal"],"ttl_seconds":3600}'
+
+# Agent tunnels postgres through the bastion
+ssh -p 10211 -N \
+  -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+  -o PreferredAuthentications=password \
+  -L 5432:db.internal:5432 \
+  keyfence <<< "$KEYFENCE_TOKEN"
+
+# Now connect to localhost:5432 — traffic is forwarded to db.internal:5432
+psql -h localhost -U app mydb
+```
+
+This works for any TCP protocol: databases, gRPC, message queues, internal APIs. KeyFence checks the destination against the token's allowed hosts and rejects everything else.
+
+### SSH key injection (git over SSH)
+
+```bash
+# Issue a token with an SSH key
+curl -H "Authorization: Bearer $KEYFENCE_API_KEY" \
+  -X POST http://localhost:10212/tokens \
+  -d '{
+    "ssh_private_key": "'"$(cat ~/.ssh/deploy_key)"'",
+    "ssh_username": "git",
+    "destinations": ["github.com"],
+    "ttl_seconds": 3600
+  }'
+
+# Agent git configuration
+export GIT_SSH_COMMAND="sshpass -p $KEYFENCE_TOKEN ssh -p 10211 \
+  -o StrictHostKeyChecking=no \
+  -o UserKnownHostsFile=/dev/null \
+  -o PreferredAuthentications=password \
+  keyfence"
+
+git clone git@github.com:owner/repo.git
+```
+
+KeyFence resolves the token, checks the destination, fetches the real SSH key, and bridges the session. The private key never enters the agent's address space. Only `exec` requests are supported (no interactive shell or PTY).
+
 ## Architecture
 
-KeyFence is a single Go binary with no external dependencies.
+KeyFence is a single Go binary with minimal dependencies (`golang.org/x/crypto` for the SSH bastion, OpenTelemetry for optional tracing, `gopher-lua` for response rule scripting).
 
 | Component | Description |
 |-----------|-------------|
 | **MITM Proxy** (`:10210`) | TLS-intercepting forward proxy. Handles CONNECT tunneling, token resolution, credential injection, upstream mTLS presentation, policy evaluation. |
+| **SSH Bastion** (`:10211`) | SSH server that authenticates agents with `kf_` tokens. Provides destination-enforced TCP forwarding for any protocol, and SSH key injection for git/SSH upstreams. |
 | **Control API** (`:10212`) | Token issuance, listing, revocation, health checks. Orchestrator-facing. Protected by `--api-key` to prevent agent access (see below). |
-| **Credential Backend** | Tokens hold references, not raw secrets. The backend fetches the real credential on each request. |
+| **Credential Backend** | Tokens hold references, not raw secrets. The backend fetches the real credential on each request. Stores API keys, client certs, and SSH keys. Supports credential rotation without token invalidation. |
 | **Local CA** | ECDSA P-256 CA generated at startup. Issues per-hostname certificates on the fly for TLS interception. |
 | **Policy Engine** | Per-request evaluation of method, path, rate limits, request budgets, body size, content type. |
+| **Lua Rule Engine** | Sandboxed Lua VM evaluates response rules against upstream JSON. Supports stateful accumulation (e.g., token usage budgets) and automatic revocation. |
+| **Webhooks / SSE** | Real-time audit event delivery via Server-Sent Events (`GET /events`) and registered webhook URLs. |
+| **Telemetry** | Optional OpenTelemetry distributed tracing. Configured via standard `OTEL_*` env vars. Silently disabled when no collector is reachable. |
 
 ## Egress Enforcement
 
@@ -273,7 +501,27 @@ spec:
               app: keyfence
       ports:
         - port: 10210
+        - port: 10211
 ```
+
+## Telemetry (OpenTelemetry)
+
+KeyFence emits distributed traces via OpenTelemetry. Every proxy request and SSH session gets a trace span with token ID, agent ID, task ID, destination, and outcome.
+
+Configuration uses standard OTel environment variables:
+
+```bash
+OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318   # OTLP/HTTP endpoint
+OTEL_SERVICE_NAME=keyfence                           # default
+OTEL_TRACES_EXPORTER=none                            # set to disable tracing
+```
+
+If no OTLP endpoint is reachable, tracing is silently disabled. KeyFence continues to operate normally.
+
+Trace spans include:
+- `proxy.connect` / `proxy.request` — HTTPS proxy operations
+- `ssh.forward` / `ssh.session` — SSH bastion operations
+- Attributes: `keyfence.token_id`, `keyfence.agent_id`, `keyfence.task_id`, `keyfence.policy`, `http.method`, `http.url`, `net.peer.name`, `http.status_code`
 
 ## What KeyFence Does Not Defend Against
 
@@ -291,6 +539,10 @@ make clean       # remove build artifacts
 ```
 
 Requires Go 1.22+.
+
+## Author
+
+Anthony Green (<green@redhat.com>)
 
 ## License
 

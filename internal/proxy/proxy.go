@@ -5,18 +5,27 @@ package proxy
 
 import (
 	"bufio"
+	"bytes"
+	"context"
 	"crypto/tls"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
 	"strings"
 	"time"
 
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+
 	"github.com/keyfence/keyfence/internal/audit"
 	"github.com/keyfence/keyfence/internal/credstore"
+	"github.com/keyfence/keyfence/internal/luaengine"
 	"github.com/keyfence/keyfence/internal/policy"
+	"github.com/keyfence/keyfence/internal/telemetry"
 	"github.com/keyfence/keyfence/internal/tokenstore"
 )
 
@@ -35,13 +44,14 @@ import (
 // about Anthropic, OpenAI, or any other API. The token carries all
 // the information: what credential to inject and where it's allowed.
 type Proxy struct {
-	ca     *CA
-	store  *tokenstore.Store
-	creds  credstore.Backend
-	certs  *credstore.CertStore
-	policy *policy.Engine
-	audit  *audit.Logger
-	addr   string
+	ca        *CA
+	store     *tokenstore.Store
+	creds     credstore.Backend
+	certs     *credstore.CertStore
+	policy    *policy.Engine
+	audit     *audit.Logger
+	lua       *luaengine.Engine
+	addr      string
 }
 
 func New(addr string, ca *CA, store *tokenstore.Store, creds credstore.Backend, certs *credstore.CertStore, pol *policy.Engine, auditLog *audit.Logger) *Proxy {
@@ -52,6 +62,7 @@ func New(addr string, ca *CA, store *tokenstore.Store, creds credstore.Backend, 
 		certs:  certs,
 		policy: pol,
 		audit:  auditLog,
+		lua:    luaengine.New(),
 		addr:   addr,
 	}
 }
@@ -101,6 +112,13 @@ func (p *Proxy) handleConnect(conn net.Conn, req *http.Request) {
 	}
 	hostname := strings.Split(host, ":")[0]
 
+	ctx, span := telemetry.Tracer().Start(context.Background(), "proxy.connect",
+		telemetry.WithSpanAttributes(
+			attribute.String("net.peer.name", hostname),
+		),
+	)
+	defer span.End()
+
 	// Send 200 to establish tunnel
 	resp := &http.Response{
 		StatusCode: 200,
@@ -110,6 +128,7 @@ func (p *Proxy) handleConnect(conn net.Conn, req *http.Request) {
 	}
 	if err := resp.Write(conn); err != nil {
 		log.Printf("write CONNECT response: %v", err)
+		span.SetStatus(codes.Error, "write CONNECT response")
 		return
 	}
 
@@ -120,6 +139,7 @@ func (p *Proxy) handleConnect(conn net.Conn, req *http.Request) {
 	tlsConn := tls.Server(conn, tlsConfig)
 	if err := tlsConn.HandshakeContext(req.Context()); err != nil {
 		log.Printf("TLS handshake for %s: %v", hostname, err)
+		span.SetStatus(codes.Error, "TLS handshake failed")
 		return
 	}
 	defer tlsConn.Close()
@@ -129,16 +149,26 @@ func (p *Proxy) handleConnect(conn net.Conn, req *http.Request) {
 	innerReq, err := http.ReadRequest(br)
 	if err != nil {
 		log.Printf("read inner request for %s: %v", hostname, err)
+		span.SetStatus(codes.Error, "read inner request")
 		return
 	}
 	innerReq.URL.Scheme = "https"
 	innerReq.URL.Host = hostname
 
-	p.processRequest(tlsConn, innerReq, hostname)
+	p.processRequest(ctx, tlsConn, innerReq, hostname)
 }
 
 // processRequest is the core: find token, validate, swap, forward.
-func (p *Proxy) processRequest(clientConn net.Conn, req *http.Request, targetHost string) {
+func (p *Proxy) processRequest(ctx context.Context, clientConn net.Conn, req *http.Request, targetHost string) {
+	_, span := telemetry.Tracer().Start(ctx, "proxy.request",
+		telemetry.WithSpanAttributes(
+			attribute.String("http.method", req.Method),
+			attribute.String("http.url", req.URL.Path),
+			attribute.String("net.peer.name", targetHost),
+		),
+	)
+	defer span.End()
+
 	// Find kf_ token in any header
 	tokenValue, tokenHeader := findToken(req)
 	if tokenValue == "" {
@@ -150,6 +180,7 @@ func (p *Proxy) processRequest(clientConn net.Conn, req *http.Request, targetHos
 			DenyRule:    "no_token",
 			DenyReason:  "no keyfence token found in request headers",
 		})
+		span.SetStatus(codes.Error, "no_token")
 		writeError(clientConn, 401, "no keyfence token found in request headers")
 		return
 	}
@@ -165,9 +196,17 @@ func (p *Proxy) processRequest(clientConn net.Conn, req *http.Request, targetHos
 			DenyRule:    "invalid_token",
 			DenyReason:  "invalid or expired keyfence token",
 		})
+		span.SetStatus(codes.Error, "invalid_token")
 		writeError(clientConn, 403, "invalid or expired keyfence token")
 		return
 	}
+
+	span.SetAttributes(
+		attribute.String("keyfence.token_id", token.ID),
+		attribute.String("keyfence.agent_id", token.AgentID),
+		attribute.String("keyfence.task_id", token.TaskID),
+		attribute.String("keyfence.policy", token.PolicyName),
+	)
 
 	// Per-token rate limit (set by operator at issuance)
 	if token.RateLimit > 0 && !p.store.CheckRate(tokenValue) {
@@ -182,12 +221,13 @@ func (p *Proxy) processRequest(clientConn net.Conn, req *http.Request, targetHos
 			DenyRule:    "rate_limit",
 			DenyReason:  fmt.Sprintf("token rate limit exceeded: %d per %s", token.RateLimit, token.RateWindow),
 		})
+		span.SetStatus(codes.Error, "rate_limit")
 		writeError(clientConn, 429, fmt.Sprintf("rate limit exceeded: %d requests per %s", token.RateLimit, token.RateWindow))
 		return
 	}
 
 	// Check destination
-	if !token.IsDestinationAllowed(targetHost) {
+	if !token.IsDestinationAllowed(targetHost, req.URL.Path) {
 		p.audit.Log(audit.Entry{
 			Event:       audit.EventDeny,
 			TokenID:     token.ID,
@@ -199,6 +239,7 @@ func (p *Proxy) processRequest(clientConn net.Conn, req *http.Request, targetHos
 			DenyRule:    "destination",
 			DenyReason:  fmt.Sprintf("token not allowed for destination %s", targetHost),
 		})
+		span.SetStatus(codes.Error, "destination_denied")
 		writeError(clientConn, 403, fmt.Sprintf("token not allowed for destination %s", targetHost))
 		return
 	}
@@ -218,6 +259,7 @@ func (p *Proxy) processRequest(clientConn net.Conn, req *http.Request, targetHos
 				DenyRule:    deny.Rule,
 				DenyReason:  deny.Message,
 			})
+			span.SetStatus(codes.Error, "policy_denied: "+deny.Rule)
 			writeError(clientConn, 403, deny.Message)
 			return
 		}
@@ -283,13 +325,21 @@ func (p *Proxy) processRequest(clientConn net.Conn, req *http.Request, targetHos
 	upstreamResp, err := p.forwardRequest(req, targetHost, clientTLSCert)
 	if err != nil {
 		log.Printf("upstream error: %v", err)
+		span.SetStatus(codes.Error, "upstream_error")
 		writeError(clientConn, 502, fmt.Sprintf("upstream error: %v", err))
 		return
 	}
 	defer upstreamResp.Body.Close()
 
-	if err := upstreamResp.Write(clientConn); err != nil {
-		log.Printf("write response: %v", err)
+	span.SetAttributes(attribute.Int("http.status_code", upstreamResp.StatusCode))
+
+	// Inspect response and run Lua rules if the token has any
+	if len(token.ResponseRules) > 0 {
+		p.inspectAndForwardResponse(clientConn, upstreamResp, token, tokenValue)
+	} else {
+		if err := upstreamResp.Write(clientConn); err != nil {
+			log.Printf("write response: %v", err)
+		}
 	}
 }
 
@@ -312,6 +362,159 @@ func (p *Proxy) forwardRequest(req *http.Request, host string, clientCert *tls.C
 	req.Header.Del("Proxy-Authorization")
 
 	return transport.RoundTrip(req)
+}
+
+const maxResponseBuffer = 10 * 1024 * 1024 // 10 MiB
+
+// inspectAndForwardResponse tees the upstream response to the client while
+// capturing the body for Lua rule evaluation. It handles both standard JSON
+// responses and SSE streaming responses.
+func (p *Proxy) inspectAndForwardResponse(clientConn net.Conn, resp *http.Response, token *tokenstore.Token, tokenValue string) {
+	ct := resp.Header.Get("Content-Type")
+
+	if strings.Contains(ct, "text/event-stream") {
+		// SSE: wrap body to capture the last data: line while streaming to client
+		capture := &sseCapture{src: resp.Body}
+		resp.Body = capture
+		if err := resp.Write(clientConn); err != nil {
+			log.Printf("write response: %v", err)
+		}
+		if capture.lastData != "" {
+			p.evalResponseRules(token, tokenValue, []byte(capture.lastData), resp)
+		}
+		return
+	}
+
+	// Buffer the body (with size limit) for JSON inspection
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBuffer))
+	if err != nil {
+		log.Printf("read response body: %v", err)
+		return
+	}
+	resp.Body = io.NopCloser(bytes.NewReader(body))
+	resp.ContentLength = int64(len(body))
+	if err := resp.Write(clientConn); err != nil {
+		log.Printf("write response: %v", err)
+	}
+
+	if strings.Contains(ct, "application/json") && len(body) > 0 {
+		p.evalResponseRules(token, tokenValue, body, resp)
+	}
+}
+
+func (p *Proxy) evalResponseRules(token *tokenstore.Token, tokenValue string, body []byte, resp *http.Response) {
+	var parsed map[string]interface{}
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		return // not valid JSON, skip
+	}
+
+	headers := make(map[string]string, len(resp.Header))
+	for k := range resp.Header {
+		headers[k] = resp.Header.Get(k)
+	}
+
+	for _, rule := range token.ResponseRules {
+		// Copy state under lock, evaluate, write back
+		token.RuleStateMu.Lock()
+		stateCopy := make(map[string]interface{}, len(token.RuleState))
+		for k, v := range token.RuleState {
+			stateCopy[k] = v
+		}
+		token.RuleStateMu.Unlock()
+
+		input := &luaengine.EvalInput{
+			ResponseBody:    parsed,
+			ResponseHeaders: headers,
+			ResponseStatus:  resp.StatusCode,
+			State:           stateCopy,
+		}
+
+		action, err := p.lua.Eval(rule.Script, input)
+		if err != nil {
+			log.Printf("lua rule error for token %s: %v", token.ID, err)
+			p.audit.Log(audit.Entry{
+				Event:      audit.EventResponseRule,
+				TokenID:    token.ID,
+				AgentID:    token.AgentID,
+				TaskID:     token.TaskID,
+				RuleAction: "error",
+				RuleReason: err.Error(),
+			})
+			continue
+		}
+
+		// Write state back
+		token.RuleStateMu.Lock()
+		for k := range token.RuleState {
+			delete(token.RuleState, k)
+		}
+		for k, v := range stateCopy {
+			token.RuleState[k] = v
+		}
+		token.RuleStateMu.Unlock()
+
+		if action == nil {
+			continue
+		}
+
+		p.audit.Log(audit.Entry{
+			Event:      audit.EventResponseRule,
+			TokenID:    token.ID,
+			AgentID:    token.AgentID,
+			TaskID:     token.TaskID,
+			RuleAction: action.Action,
+			RuleReason: action.Reason,
+		})
+
+		switch action.Action {
+		case "revoke":
+			p.store.Revoke(tokenValue)
+			p.audit.Log(audit.Entry{
+				Event:   audit.EventRevoke,
+				TokenID: token.ID,
+				AgentID: token.AgentID,
+				TaskID:  token.TaskID,
+				Label:   "revoked by response rule: " + action.Reason,
+			})
+		case "alert":
+			// audit event already logged above
+		}
+	}
+}
+
+// sseCapture wraps a ReadCloser and captures the last SSE "data:" payload
+// while passing all bytes through. This allows the proxy to stream the
+// response to the client in real-time while recording the final event
+// (which typically contains usage data in LLM APIs).
+type sseCapture struct {
+	src      io.ReadCloser
+	buf      bytes.Buffer
+	lastData string
+}
+
+func (s *sseCapture) Read(p []byte) (int, error) {
+	n, err := s.src.Read(p)
+	if n > 0 {
+		s.buf.Write(p[:n])
+		// Scan for complete lines
+		for {
+			line, lineErr := s.buf.ReadString('\n')
+			if lineErr != nil {
+				// Incomplete line — put it back for next Read
+				s.buf.WriteString(line)
+				break
+			}
+			trimmed := strings.TrimSpace(line)
+			if strings.HasPrefix(trimmed, "data:") && trimmed != "data: [DONE]" {
+				s.lastData = strings.TrimSpace(strings.TrimPrefix(trimmed, "data:"))
+			}
+		}
+	}
+	return n, err
+}
+
+func (s *sseCapture) Close() error {
+	return s.src.Close()
 }
 
 // findToken looks for a kf_ token in any request header value.

@@ -12,6 +12,8 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"path"
+	"strings"
 	"sync"
 	"time"
 )
@@ -20,7 +22,7 @@ type Token struct {
 	ID                  string
 	Value               string   // kf_<random>
 	CredentialID        string   // reference into credential backend
-	AllowedDestinations []string // hosts this token can be used against
+	AllowedDestinations []string // hosts or host/path patterns this token can be used against
 	PolicyName          string   // optional policy to evaluate on each request
 	AgentID             string        // orchestrator-assigned agent identity
 	TaskID              string        // orchestrator-assigned task scope
@@ -28,6 +30,10 @@ type Token struct {
 	RateWindow          time.Duration // window duration
 	ClientCertID        string        // reference to cert+key in cert store
 	ClientCertHeader    string        // header to inject cert PEM into (optional)
+	SSHKeyID            string        // reference to SSH key in SSH key store
+	ResponseRules       []ResponseRule // Lua scripts evaluated against each response
+	RuleState           map[string]interface{} // mutable state persisted across requests
+	RuleStateMu         sync.Mutex    // protects RuleState
 	CreatedAt           time.Time
 	ExpiresAt           time.Time
 	Label               string // optional human-readable label
@@ -46,16 +52,50 @@ func (t *Token) IsValid() bool {
 	return time.Now().Before(t.ExpiresAt)
 }
 
-func (t *Token) IsDestinationAllowed(host string) bool {
+// IsDestinationAllowed checks whether a request to host+path is permitted.
+// Destination entries can be:
+//   - "api.example.com"          — host only (matches all paths)
+//   - "api.example.com/v1/chat"  — host + exact path
+//   - "api.example.com/v1/*"     — host + path glob
+func (t *Token) IsDestinationAllowed(host, reqPath string) bool {
 	if len(t.AllowedDestinations) == 0 {
 		return true // no restrictions
 	}
 	for _, d := range t.AllowedDestinations {
-		if d == host {
+		dHost, dPath := splitDestination(d)
+		if dHost != host {
+			continue
+		}
+		if dPath == "" {
+			return true // host-only entry matches all paths
+		}
+		if matchPath(dPath, reqPath) {
 			return true
 		}
 	}
 	return false
+}
+
+func splitDestination(entry string) (host, pathPattern string) {
+	idx := strings.Index(entry, "/")
+	if idx == -1 {
+		return entry, ""
+	}
+	return entry[:idx], entry[idx:]
+}
+
+func matchPath(pattern, reqPath string) bool {
+	if strings.HasSuffix(pattern, "/*") {
+		prefix := strings.TrimSuffix(pattern, "/*")
+		return reqPath == prefix || strings.HasPrefix(reqPath, prefix+"/")
+	}
+	matched, _ := path.Match(pattern, reqPath)
+	return matched
+}
+
+// ResponseRule is a Lua script evaluated against JSON responses.
+type ResponseRule struct {
+	Script string `json:"script"`
 }
 
 type Store struct {
@@ -82,6 +122,8 @@ type IssueParams struct {
 	RateWindow          time.Duration
 	ClientCertID        string
 	ClientCertHeader    string
+	SSHKeyID            string
+	ResponseRules       []ResponseRule
 }
 
 func (s *Store) Issue(p IssueParams) (*Token, error) {
@@ -105,6 +147,9 @@ func (s *Store) Issue(p IssueParams) (*Token, error) {
 		RateWindow:          p.RateWindow,
 		ClientCertID:        p.ClientCertID,
 		ClientCertHeader:    p.ClientCertHeader,
+		SSHKeyID:            p.SSHKeyID,
+		ResponseRules:       p.ResponseRules,
+		RuleState:           make(map[string]interface{}),
 		CreatedAt:           now,
 		ExpiresAt:           now.Add(p.TTL),
 		Label:               p.Label,
@@ -167,6 +212,20 @@ func (s *Store) List() []*Token {
 		result = append(result, t)
 	}
 	return result
+}
+
+// CountByCredentialID returns the number of valid tokens referencing a credential.
+func (s *Store) CountByCredentialID(credID string) int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	count := 0
+	for _, t := range s.tokens {
+		if t.IsValid() && t.CredentialID == credID {
+			count++
+		}
+	}
+	return count
 }
 
 // CheckRate evaluates the token's per-token rate limit.
