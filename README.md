@@ -9,7 +9,7 @@ KeyFence is a single-binary proxy that sits between AI agents and the services t
 - **Enforce policies** — restrict HTTP methods, content types, body sizes, and rate limits per token.
 - **Set usage budgets with Lua scripting** — attach Lua scripts that inspect upstream JSON responses, accumulate metrics like LLM token usage across requests, and automatically revoke a token when a budget is exceeded.
 - **Rotate credentials without disruption** — swap the underlying secret and all tokens pick up the new value on their next request. No reissuance needed.
-- **Tunnel any protocol** — forward postgres, gRPC, or any TCP traffic through the KeyFence proxy with destination enforcement.
+- **Inject SSH keys** — agents authenticate to the SSH bastion with a `kf_` token; KeyFence holds the real private key and bridges the session upstream.
 - **Monitor everything in real-time** — structured audit logs, Server-Sent Events stream, webhook delivery, and OpenTelemetry distributed tracing on every request.
 - **Deploy as a sidecar** — run KeyFence alongside your agent in a podman pod or Kubernetes sidecar. Agents reach the proxy at localhost.
 
@@ -40,7 +40,6 @@ KeyFence is a credential containment proxy for bearer tokens, Basic auth, mTLS c
 | **Basic auth** | Token found inside Base64-decoded `Authorization: Basic` header |
 | **Client certificates** | KeyFence presents the cert+key on the upstream TLS handshake; agent never has the private key |
 | **SSH keys** | Agent authenticates to KeyFence's SSH bastion with a `kf_` token; KeyFence connects upstream with the real SSH key |
-| **TCP forwarding** | Agent tunnels any protocol (postgres, gRPC, etc.) through the SSH bastion; KeyFence enforces destination policy |
 
 > **Scope today:** KeyFence protects credentials carried in HTTP headers, client certificates presented at the TLS layer, and SSH private keys. Credentials that require local cryptographic operations (AWS SigV4 signing, JWT minting) are out of scope for v1 — see [What KeyFence Does Not Defend Against](#what-keyfence-does-not-defend-against).
 
@@ -415,37 +414,9 @@ curl -X POST http://localhost:10212/tokens \
 
 A token can carry both a header credential and a client certificate, or either one alone.
 
-## SSH Bastion (TCP forwarding and SSH key injection)
+## SSH Key Injection
 
-KeyFence includes an SSH bastion on `:10211`. The agent authenticates with a `kf_` token as the SSH password. The bastion serves two purposes:
-
-1. **TCP forwarding** — tunnel any protocol to allowed destinations. KeyFence enforces destination policy but doesn't touch the bytes. No SSH key needed on the token.
-2. **SSH key injection** — for SSH-based upstreams (git, etc.), KeyFence holds the real private key and authenticates upstream. The agent never has the key.
-
-### TCP forwarding (any protocol)
-
-Forward a postgres connection through KeyFence:
-
-```bash
-# Issue a token (no SSH key needed for TCP forwarding)
-curl -H "Authorization: Bearer $KEYFENCE_API_KEY" \
-  -X POST http://localhost:10212/tokens \
-  -d '{"credential":"unused","destinations":["db.internal"],"ttl_seconds":3600}'
-
-# Agent tunnels postgres through the bastion
-ssh -p 10211 -N \
-  -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-  -o PreferredAuthentications=password \
-  -L 5432:db.internal:5432 \
-  keyfence <<< "$KEYFENCE_TOKEN"
-
-# Now connect to localhost:5432 — traffic is forwarded to db.internal:5432
-psql -h localhost -U app mydb
-```
-
-This works for any TCP protocol: databases, gRPC, message queues, internal APIs. KeyFence checks the destination against the token's allowed hosts and rejects everything else.
-
-### SSH key injection (git over SSH)
+KeyFence includes an SSH bastion on `:10211` for git-over-SSH and other SSH-based upstreams. The agent authenticates with a `kf_` token as the SSH password. KeyFence holds the real SSH private key and authenticates upstream on the agent's behalf — the agent never has the key.
 
 ```bash
 # Issue a token with an SSH key
@@ -468,7 +439,7 @@ export GIT_SSH_COMMAND="sshpass -p $KEYFENCE_TOKEN ssh -p 10211 \
 git clone git@github.com:owner/repo.git
 ```
 
-KeyFence resolves the token, checks the destination, fetches the real SSH key, and bridges the session. The private key never enters the agent's address space. Only `exec` requests are supported (no interactive shell or PTY).
+KeyFence resolves the token, fetches the real SSH key, and bridges the session. The private key never enters the agent's address space. Only `exec` requests are supported (no interactive shell or PTY).
 
 ## Architecture
 
@@ -477,7 +448,7 @@ KeyFence is a single Go binary with minimal dependencies (`golang.org/x/crypto` 
 | Component | Description |
 |-----------|-------------|
 | **MITM Proxy** (`:10210`) | TLS-intercepting forward proxy. Handles CONNECT tunneling, token resolution, credential injection, upstream mTLS presentation, policy evaluation. |
-| **SSH Bastion** (`:10211`) | SSH server that authenticates agents with `kf_` tokens. Provides destination-enforced TCP forwarding for any protocol, and SSH key injection for git/SSH upstreams. |
+| **SSH Bastion** (`:10211`) | SSH server that authenticates agents with `kf_` tokens. Holds real SSH private keys and bridges sessions to upstream hosts (git, etc.). |
 | **Control API** (`:10212`) | Token issuance, listing, revocation, health checks. Orchestrator-facing. Protected by `--api-key` to prevent agent access (see below). |
 | **Credential Backend** | Tokens hold references, not raw secrets. The backend fetches the real credential on each request. Stores API keys, client certs, and SSH keys. Supports credential rotation without token invalidation. |
 | **Local CA** | ECDSA P-256 CA generated at startup. Issues per-hostname certificates on the fly for TLS interception. |
