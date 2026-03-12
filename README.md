@@ -1,6 +1,6 @@
 # KeyFence
 
-**Credential containment for AI agents.**
+**If an AI agent can read a credential, that credential can be exfiltrated. KeyFence makes sure it never can.**
 
 KeyFence is a single-binary proxy that sits between AI agents and the services they use. Agents never hold real credentials — only short-lived, scoped tokens that KeyFence resolves on each request. With KeyFence you can:
 
