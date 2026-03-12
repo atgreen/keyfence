@@ -22,6 +22,10 @@ type Backend interface {
 
 	// Fetch returns the real credential value for a given ID.
 	Fetch(id string) (string, error)
+
+	// Update replaces the value of an existing credential. All tokens
+	// referencing this ID will use the new value on their next request.
+	Update(id, newValue string) error
 }
 
 // EnvBackend stores credentials in-memory, keyed by auto-generated IDs.
@@ -60,6 +64,17 @@ func (e *EnvBackend) Fetch(id string) (string, error) {
 		return "", fmt.Errorf("credential %q not found", id)
 	}
 	return val, nil
+}
+
+func (e *EnvBackend) Update(id, newValue string) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	if _, ok := e.creds[id]; !ok {
+		return fmt.Errorf("credential %q not found", id)
+	}
+	e.creds[id] = newValue
+	return nil
 }
 
 // ClientCert holds a PEM-encoded client certificate and private key.
@@ -102,6 +117,68 @@ func (c *CertStore) Fetch(id string) (*ClientCert, error) {
 	return cert, nil
 }
 
+func (c *CertStore) Update(id, certPEM, keyPEM string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if _, ok := c.certs[id]; !ok {
+		return fmt.Errorf("client cert %q not found", id)
+	}
+	c.certs[id] = &ClientCert{CertPEM: certPEM, KeyPEM: keyPEM}
+	return nil
+}
+
+// SSHKey holds an SSH private key and the username to connect as.
+type SSHKey struct {
+	PrivateKeyPEM string
+	Username      string // e.g. "git"
+}
+
+// SSHKeyStore stores SSH private keys in memory.
+type SSHKeyStore struct {
+	mu   sync.RWMutex
+	keys map[string]*SSHKey
+	seq  int
+}
+
+func NewSSHKeyStore() *SSHKeyStore {
+	return &SSHKeyStore{
+		keys: make(map[string]*SSHKey),
+	}
+}
+
+func (s *SSHKeyStore) Store(privateKeyPEM, username string) (string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.seq++
+	id := fmt.Sprintf("sshkey_%d", s.seq)
+	s.keys[id] = &SSHKey{PrivateKeyPEM: privateKeyPEM, Username: username}
+	return id, nil
+}
+
+func (s *SSHKeyStore) Fetch(id string) (*SSHKey, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	key, ok := s.keys[id]
+	if !ok {
+		return nil, fmt.Errorf("ssh key %q not found", id)
+	}
+	return key, nil
+}
+
+func (s *SSHKeyStore) Update(id, privateKeyPEM, username string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, ok := s.keys[id]; !ok {
+		return fmt.Errorf("ssh key %q not found", id)
+	}
+	s.keys[id] = &SSHKey{PrivateKeyPEM: privateKeyPEM, Username: username}
+	return nil
+}
+
 // EnvMappedBackend reads credentials from environment variables.
 // Credential IDs are environment variable names.
 type EnvMappedBackend struct{}
@@ -112,6 +189,10 @@ func NewEnvMappedBackend() *EnvMappedBackend {
 
 func (e *EnvMappedBackend) Store(value string) (string, error) {
 	return "", fmt.Errorf("env-mapped backend does not support storing credentials; set them as environment variables on the KeyFence process")
+}
+
+func (e *EnvMappedBackend) Update(id, newValue string) error {
+	return fmt.Errorf("env-mapped backend does not support credential rotation")
 }
 
 func (e *EnvMappedBackend) Fetch(id string) (string, error) {

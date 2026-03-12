@@ -5,6 +5,7 @@
 //
 // Single binary:
 //   - MITM forward proxy on :10210 (agents set HTTPS_PROXY here)
+//   - SSH bastion on :10211 (agents use as SSH proxy for git)
 //   - Token management API on :10212
 //
 // KeyFence is service-agnostic. It doesn't know about Anthropic, OpenAI,
@@ -33,12 +34,14 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"time"
 
@@ -46,16 +49,29 @@ import (
 	"github.com/keyfence/keyfence/internal/credstore"
 	"github.com/keyfence/keyfence/internal/policy"
 	"github.com/keyfence/keyfence/internal/proxy"
+	"github.com/keyfence/keyfence/internal/sshproxy"
+	"github.com/keyfence/keyfence/internal/telemetry"
 	"github.com/keyfence/keyfence/internal/tokenstore"
 )
 
 func main() {
 	proxyAddr := flag.String("proxy", ":10210", "proxy listen address")
+	sshAddr := flag.String("ssh", ":10211", "SSH bastion listen address")
 	apiAddr := flag.String("api", ":10212", "token management API listen address")
 	dataDir := flag.String("data-dir", defaultDataDir(), "data directory for CA certs")
 	certsDir := flag.String("certs-dir", "", "directory to export CA cert for agents (optional)")
 	apiKey := flag.String("api-key", "", "require this Bearer token on all control API requests (strongly recommended)")
 	flag.Parse()
+
+	// Initialize OpenTelemetry (configured via OTEL_* env vars)
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
+	otelShutdown, err := telemetry.Init(ctx, "dev")
+	if err != nil {
+		log.Printf("otel init (tracing disabled): %v", err)
+	} else {
+		defer otelShutdown(context.Background())
+	}
 
 	// Load or create local CA
 	caDir := filepath.Join(*dataDir, "ca")
@@ -73,10 +89,13 @@ func main() {
 	}
 
 	auditLog := audit.New(os.Stdout)
+	sseSink := audit.NewSSESink()
+	auditLog.AddSink(sseSink)
 
 	store := tokenstore.New()
 	creds := credstore.NewEnvBackend()
 	certs := credstore.NewCertStore()
+	sshKeys := credstore.NewSSHKeyStore()
 	pol := policy.NewEngine()
 
 	// Register built-in policies
@@ -103,11 +122,23 @@ func main() {
 		AllowedMethods: []string{"GET", "HEAD"},
 	})
 
-	// Start proxy
+	// Start HTTPS proxy
 	p := proxy.New(*proxyAddr, ca, store, creds, certs, pol, auditLog)
 	go func() {
 		if err := p.ListenAndServe(); err != nil {
 			log.Fatalf("proxy: %v", err)
+		}
+	}()
+
+	// Start SSH bastion
+	sshDir := filepath.Join(*dataDir, "ssh")
+	sshServer, err := sshproxy.New(*sshAddr, sshDir, store, sshKeys, auditLog)
+	if err != nil {
+		log.Fatalf("ssh: %v", err)
+	}
+	go func() {
+		if err := sshServer.ListenAndServe(); err != nil {
+			log.Fatalf("ssh: %v", err)
 		}
 	}()
 
@@ -119,11 +150,16 @@ func main() {
 
 	// Token management API
 	mux := http.NewServeMux()
-	mux.HandleFunc("POST /tokens", requireAPIKey(*apiKey, handleIssueToken(store, creds, certs, auditLog)))
+	mux.HandleFunc("POST /tokens", requireAPIKey(*apiKey, handleIssueToken(store, creds, certs, sshKeys, auditLog)))
 	mux.HandleFunc("GET /tokens", requireAPIKey(*apiKey, handleListTokens(store)))
 	mux.HandleFunc("DELETE /tokens/{token}", requireAPIKey(*apiKey, handleRevokeToken(store, auditLog)))
 	mux.HandleFunc("DELETE /tasks/{task_id}/tokens", requireAPIKey(*apiKey, handleRevokeByTask(store, auditLog)))
 	mux.HandleFunc("GET /policies", requireAPIKey(*apiKey, handleListPolicies(pol)))
+	mux.HandleFunc("PUT /credentials/{id}", requireAPIKey(*apiKey, handleRotateCredential(creds, store, auditLog)))
+	mux.HandleFunc("PUT /credentials/{id}/cert", requireAPIKey(*apiKey, handleRotateCert(certs, auditLog)))
+	mux.HandleFunc("PUT /credentials/{id}/sshkey", requireAPIKey(*apiKey, handleRotateSSHKey(sshKeys, auditLog)))
+	mux.HandleFunc("POST /webhooks", requireAPIKey(*apiKey, handleRegisterWebhook(auditLog)))
+	mux.HandleFunc("GET /events", requireAPIKey(*apiKey, sseSink.ServeHTTP))
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
@@ -176,6 +212,9 @@ type issueRequest struct {
 	ClientCert        string   `json:"client_cert"`
 	ClientKey         string   `json:"client_key"`
 	ClientCertHeader  string   `json:"client_cert_header"`
+	SSHPrivateKey     string                   `json:"ssh_private_key"`
+	SSHUsername       string                   `json:"ssh_username"`
+	ResponseRules     []tokenstore.ResponseRule `json:"response_rules"`
 }
 
 type issueResponse struct {
@@ -188,15 +227,15 @@ type issueResponse struct {
 	TaskID       string   `json:"task_id,omitempty"`
 }
 
-func handleIssueToken(store *tokenstore.Store, creds credstore.Backend, certStore *credstore.CertStore, auditLog *audit.Logger) http.HandlerFunc {
+func handleIssueToken(store *tokenstore.Store, creds credstore.Backend, certStore *credstore.CertStore, sshKeyStore *credstore.SSHKeyStore, auditLog *audit.Logger) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var req issueRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			http.Error(w, fmt.Sprintf(`{"error":"invalid json: %s"}`, err), 400)
 			return
 		}
-		if req.Credential == "" && req.ClientCert == "" {
-			http.Error(w, `{"error":"credential or client_cert is required"}`, 400)
+		if req.Credential == "" && req.ClientCert == "" && req.SSHPrivateKey == "" {
+			http.Error(w, `{"error":"credential, client_cert, or ssh_private_key is required"}`, 400)
 			return
 		}
 
@@ -226,6 +265,21 @@ func handleIssueToken(store *tokenstore.Store, creds credstore.Backend, certStor
 			}
 		}
 
+		// Store the SSH private key (if provided)
+		var sshKeyID string
+		if req.SSHPrivateKey != "" {
+			username := req.SSHUsername
+			if username == "" {
+				username = "git"
+			}
+			var err error
+			sshKeyID, err = sshKeyStore.Store(req.SSHPrivateKey, username)
+			if err != nil {
+				http.Error(w, fmt.Sprintf(`{"error":"storing ssh key: %s"}`, err), 500)
+				return
+			}
+		}
+
 		ttl := time.Duration(req.TTLSeconds) * time.Second
 		if ttl <= 0 {
 			ttl = 5 * time.Minute
@@ -245,6 +299,8 @@ func handleIssueToken(store *tokenstore.Store, creds credstore.Backend, certStor
 			RateWindow:          rateWindow,
 			ClientCertID:        clientCertID,
 			ClientCertHeader:    req.ClientCertHeader,
+			SSHKeyID:            sshKeyID,
+			ResponseRules:       req.ResponseRules,
 		})
 		if err != nil {
 			http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err), 500)
@@ -368,5 +424,127 @@ func handleListPolicies(pol *policy.Engine) http.HandlerFunc {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(result)
+	}
+}
+
+// --- Credential rotation handlers ---
+
+func handleRotateCredential(creds credstore.Backend, store *tokenstore.Store, auditLog *audit.Logger) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		id := r.PathValue("id")
+		var req struct {
+			Credential string `json:"credential"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, fmt.Sprintf(`{"error":"invalid json: %s"}`, err), 400)
+			return
+		}
+		if req.Credential == "" {
+			http.Error(w, `{"error":"credential is required"}`, 400)
+			return
+		}
+		if err := creds.Update(id, req.Credential); err != nil {
+			http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err), 404)
+			return
+		}
+		count := store.CountByCredentialID(id)
+		auditLog.Log(audit.Entry{
+			Event:        audit.EventRotate,
+			CredentialID: id,
+			Label:        fmt.Sprintf("credential rotated, %d active tokens", count),
+		})
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":          "rotated",
+			"credential_id":   id,
+			"affected_tokens": count,
+		})
+	}
+}
+
+func handleRotateCert(certs *credstore.CertStore, auditLog *audit.Logger) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		id := r.PathValue("id")
+		var req struct {
+			ClientCert string `json:"client_cert"`
+			ClientKey  string `json:"client_key"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, fmt.Sprintf(`{"error":"invalid json: %s"}`, err), 400)
+			return
+		}
+		if req.ClientCert == "" || req.ClientKey == "" {
+			http.Error(w, `{"error":"client_cert and client_key are required"}`, 400)
+			return
+		}
+		if err := certs.Update(id, req.ClientCert, req.ClientKey); err != nil {
+			http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err), 404)
+			return
+		}
+		auditLog.Log(audit.Entry{
+			Event:        audit.EventRotate,
+			CredentialID: id,
+			Label:        "client cert rotated",
+		})
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"status": "rotated", "credential_id": id})
+	}
+}
+
+func handleRotateSSHKey(sshKeys *credstore.SSHKeyStore, auditLog *audit.Logger) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		id := r.PathValue("id")
+		var req struct {
+			SSHPrivateKey string `json:"ssh_private_key"`
+			SSHUsername   string `json:"ssh_username"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, fmt.Sprintf(`{"error":"invalid json: %s"}`, err), 400)
+			return
+		}
+		if req.SSHPrivateKey == "" {
+			http.Error(w, `{"error":"ssh_private_key is required"}`, 400)
+			return
+		}
+		username := req.SSHUsername
+		if username == "" {
+			username = "git"
+		}
+		if err := sshKeys.Update(id, req.SSHPrivateKey, username); err != nil {
+			http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err), 404)
+			return
+		}
+		auditLog.Log(audit.Entry{
+			Event:        audit.EventRotate,
+			CredentialID: id,
+			Label:        "ssh key rotated",
+		})
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"status": "rotated", "credential_id": id})
+	}
+}
+
+// --- Webhook management handler ---
+
+func handleRegisterWebhook(auditLog *audit.Logger) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			URL    string   `json:"url"`
+			Secret string   `json:"secret"`
+			Events []string `json:"events"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, fmt.Sprintf(`{"error":"invalid json: %s"}`, err), 400)
+			return
+		}
+		if req.URL == "" {
+			http.Error(w, `{"error":"url is required"}`, 400)
+			return
+		}
+		wh := audit.NewWebhookSink(req.URL, req.Secret, req.Events)
+		auditLog.AddSink(wh)
+		go wh.Run()
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"status": "registered", "url": req.URL})
 	}
 }
