@@ -43,10 +43,8 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"strings"
 	"time"
 
-	"github.com/keyfence/keyfence/internal/acl"
 	"github.com/keyfence/keyfence/internal/audit"
 	"github.com/keyfence/keyfence/internal/credstore"
 	"github.com/keyfence/keyfence/internal/policy"
@@ -63,10 +61,6 @@ func main() {
 	dataDir := flag.String("data-dir", defaultDataDir(), "data directory for CA certs")
 	certsDir := flag.String("certs-dir", "", "directory to export CA cert for agents (optional)")
 	apiKey := flag.String("api-key", "", "require this Bearer token on all control API requests (strongly recommended)")
-	denyFile := flag.String("deny-file", "", "file containing denied destinations, one per line (e.g. from a ConfigMap)")
-	allowNoTokenFile := flag.String("allow-without-token-file", "", "file containing destinations that bypass token requirements, one per line")
-	denyList := flag.String("deny", "", "comma-separated deny list (alternative to --deny-file)")
-	allowNoToken := flag.String("allow-without-token", "", "comma-separated allow-without-token list (alternative to --allow-without-token-file)")
 	flag.Parse()
 
 	// Initialize OpenTelemetry (configured via OTEL_* env vars)
@@ -128,34 +122,8 @@ func main() {
 		AllowedMethods: []string{"GET", "HEAD"},
 	})
 
-	// Build global ACL (file entries + inline entries merged)
-	denyEntries := splitCSV(*denyList)
-	if *denyFile != "" {
-		entries, err := loadListFile(*denyFile)
-		if err != nil {
-			log.Fatalf("deny-file: %v", err)
-		}
-		denyEntries = append(denyEntries, entries...)
-	}
-	allowEntries := splitCSV(*allowNoToken)
-	if *allowNoTokenFile != "" {
-		entries, err := loadListFile(*allowNoTokenFile)
-		if err != nil {
-			log.Fatalf("allow-without-token-file: %v", err)
-		}
-		allowEntries = append(allowEntries, entries...)
-	}
-	aclList := acl.New(denyEntries, allowEntries)
-	if len(denyEntries) > 0 {
-		log.Printf("deny list: %d entries", len(denyEntries))
-	}
-	if len(allowEntries) > 0 {
-		log.Printf("WARNING: allow-without-token: %d entries", len(allowEntries))
-		log.Printf("WARNING: These destinations bypass token requirements. Use sparingly.")
-	}
-
 	// Start HTTPS proxy
-	p := proxy.New(*proxyAddr, ca, store, creds, certs, pol, auditLog, aclList)
+	p := proxy.New(*proxyAddr, ca, store, creds, certs, pol, auditLog)
 	go func() {
 		if err := p.ListenAndServe(); err != nil {
 			log.Fatalf("proxy: %v", err)
@@ -164,7 +132,7 @@ func main() {
 
 	// Start SSH bastion
 	sshDir := filepath.Join(*dataDir, "ssh")
-	sshServer, err := sshproxy.New(*sshAddr, sshDir, store, sshKeys, auditLog, aclList)
+	sshServer, err := sshproxy.New(*sshAddr, sshDir, store, sshKeys, auditLog)
 	if err != nil {
 		log.Fatalf("ssh: %v", err)
 	}
@@ -211,39 +179,6 @@ func main() {
 	if err := http.ListenAndServe(*apiAddr, mux); err != nil {
 		log.Fatalf("api: %v", err)
 	}
-}
-
-// loadListFile reads a file with one entry per line. Blank lines and
-// lines starting with # are ignored. Designed for ConfigMap mounts.
-func loadListFile(path string) ([]string, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, err
-	}
-	var entries []string
-	for _, line := range strings.Split(string(data), "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-		entries = append(entries, line)
-	}
-	return entries, nil
-}
-
-func splitCSV(s string) []string {
-	if s == "" {
-		return nil
-	}
-	parts := strings.Split(s, ",")
-	result := make([]string, 0, len(parts))
-	for _, p := range parts {
-		p = strings.TrimSpace(p)
-		if p != "" {
-			result = append(result, p)
-		}
-	}
-	return result
 }
 
 func defaultDataDir() string {
