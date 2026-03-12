@@ -19,9 +19,17 @@ Traditional secret management (Vault, 1Password, environment variables) solves t
 
 ## How KeyFence Works
 
-KeyFence is an egress-controlled credential broker for bearer-style and header-based credentials (API keys, PATs, bot tokens). It sits between the agent and the internet as an HTTPS proxy. The agent never possesses real credentials — only short-lived, destination-locked opaque tokens (`kf_...`) that are worthless outside the proxy.
+KeyFence is an egress-controlled credential containment proxy for bearer tokens, Basic auth, and mTLS client certificates. It sits between the agent and the internet as an HTTPS proxy. The agent never possesses real credentials — only short-lived, destination-locked opaque tokens (`kf_...`) that are worthless outside the proxy.
 
-> **Scope today:** KeyFence protects credentials that are carried in HTTP headers. Credentials that require local cryptographic operations (AWS SigV4 signing, JWT minting) are out of scope for v1 — see [What KeyFence Does Not Defend Against](#what-keyfence-does-not-defend-against).
+### Supported credential types
+
+| Type | How it works |
+|------|-------------|
+| **Bearer / API keys** | Token found in any header value, swapped for real credential |
+| **Basic auth** | Token found inside Base64-decoded `Authorization: Basic` header |
+| **Client certificates** | KeyFence presents the cert+key on the upstream TLS handshake; agent never has the private key |
+
+> **Scope today:** KeyFence protects credentials carried in HTTP headers and client certificates presented at the TLS layer. Credentials that require local cryptographic operations (AWS SigV4 signing, JWT minting) are out of scope for v1 — see [What KeyFence Does Not Defend Against](#what-keyfence-does-not-defend-against).
 
 ```
 ┌──────────────────────────────────────┐
@@ -40,7 +48,7 @@ KeyFence is an egress-controlled credential broker for bearer-style and header-b
 │  1. Intercept TLS (MITM with CA)     │
 │  2. Find kf_ token in headers        │
 │  3. Validate: TTL, destination,      │
-│     method, path, rate limit, DLP    │
+│     method, path, rate limit         │
 │  4. Fetch real credential from       │
 │     backend                          │
 │  5. Swap token → real credential     │
@@ -187,17 +195,37 @@ curl -X POST http://localhost:10212/tokens \
   -d '{"credential":"sk-ant-key","destinations":["api.anthropic.com"],"policy":"readonly"}'
 ```
 
-## DLP (Data Loss Prevention)
+## Client Certificates (mTLS)
 
-KeyFence scans outbound request bodies for credential patterns before forwarding. If an agent tries to exfiltrate a real API key in a message body, the request is blocked.
+KeyFence can present client certificates to upstream services that require mutual TLS. The agent never has the private key — KeyFence holds it and presents it during the upstream TLS handshake.
 
-Detected patterns:
-- Anthropic API keys (`sk-ant-...`)
-- OpenAI API keys (`sk-proj-...`)
-- Slack bot tokens (`xoxb-...`)
-- GitHub PATs (`ghp_...`)
+```bash
+# Issue a token with a client certificate
+curl -H "Authorization: Bearer $KEYFENCE_API_KEY" \
+  -X POST http://localhost:10212/tokens \
+  -d '{
+    "client_cert": "-----BEGIN CERTIFICATE-----\n...\n-----END CERTIFICATE-----",
+    "client_key": "-----BEGIN EC PRIVATE KEY-----\n...\n-----END EC PRIVATE KEY-----",
+    "destinations": ["internal-api.example.com"],
+    "ttl_seconds": 300
+  }'
+```
 
-DLP is defense-in-depth. The primary defense is that the agent never possesses real credentials in the first place.
+This works because KeyFence terminates the agent-side TLS and initiates a separate upstream TLS connection. For mTLS upstreams, KeyFence presents the client certificate on that upstream connection. The private key never leaves the KeyFence process.
+
+Optionally, the certificate PEM can also be injected into a request header for services that expect it (e.g., behind a TLS-terminating load balancer):
+
+```bash
+curl -X POST http://localhost:10212/tokens \
+  -d '{
+    "client_cert": "...",
+    "client_key": "...",
+    "client_cert_header": "X-Client-Cert",
+    "destinations": ["internal-api.example.com"]
+  }'
+```
+
+A token can carry both a header credential and a client certificate, or either one alone.
 
 ## Architecture
 
@@ -205,7 +233,7 @@ KeyFence is a single Go binary with no external dependencies.
 
 | Component | Description |
 |-----------|-------------|
-| **MITM Proxy** (`:10210`) | TLS-intercepting forward proxy. Handles CONNECT tunneling, token resolution, credential injection, policy evaluation, DLP scanning. |
+| **MITM Proxy** (`:10210`) | TLS-intercepting forward proxy. Handles CONNECT tunneling, token resolution, credential injection, upstream mTLS presentation, policy evaluation. |
 | **Control API** (`:10212`) | Token issuance, listing, revocation, health checks. Orchestrator-facing. Protected by `--api-key` to prevent agent access (see below). |
 | **Credential Backend** | Tokens hold references, not raw secrets. The backend fetches the real credential on each request. |
 | **Local CA** | ECDSA P-256 CA generated at startup. Issues per-hostname certificates on the fly for TLS interception. |

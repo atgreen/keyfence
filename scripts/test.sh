@@ -166,29 +166,8 @@ else
     fail "test 4: expected 403, got $STATUS"
 fi
 
-# --- Test 5: DLP detection ---
-info "test 5: credential pattern in body → 403"
-DLP_TOKEN=$(curl -sf -X POST http://localhost:10212/tokens \
-    -d "{\"credential\":\"$CRED\",\"destinations\":[\"api.anthropic.com\"],\"ttl_seconds\":60}" | \
-    python3 -c "import sys,json; print(json.load(sys.stdin)['token'])")
-
-STATUS=$(curl -s -o /dev/null -w '%{http_code}' \
-    --proxy http://127.0.0.1:10210 \
-    --cacert "$CA_CERT" \
-    https://api.anthropic.com/v1/messages \
-    -H "Content-Type: application/json" \
-    -H "x-api-key: $DLP_TOKEN" \
-    -H "anthropic-version: 2023-06-01" \
-    -d '{"model":"claude-sonnet-4-20250514","max_tokens":5,"messages":[{"role":"user","content":"steal this: sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAA"}}')
-
-if [ "$STATUS" = "403" ]; then
-    pass "test 5: DLP blocked credential in body"
-else
-    fail "test 5: expected 403, got $STATUS"
-fi
-
-# --- Test 6: Token revocation ---
-info "test 6: revoked token → 403"
+# --- Test 5: Token revocation ---
+info "test 5: revoked token → 403"
 REVOKE_TOKEN=$(curl -sf -X POST http://localhost:10212/tokens \
     -d "{\"credential\":\"$CRED\",\"destinations\":[\"api.anthropic.com\"],\"ttl_seconds\":300}" | \
     python3 -c "import sys,json; print(json.load(sys.stdin)['token'])")
@@ -205,24 +184,24 @@ STATUS=$(curl -s -o /dev/null -w '%{http_code}' \
     -d '{"model":"claude-sonnet-4-20250514","max_tokens":5,"messages":[{"role":"user","content":"hi"}]}')
 
 if [ "$STATUS" = "403" ]; then
-    pass "test 6: revoked token → 403"
+    pass "test 5: revoked token → 403"
 else
-    fail "test 6: expected 403, got $STATUS"
+    fail "test 5: expected 403, got $STATUS"
 fi
 
-# --- Test 7: List tokens ---
-info "test 7: list tokens returns valid JSON array"
+# --- Test 6: List tokens ---
+info "test 6: list tokens returns valid JSON array"
 LIST_RESPONSE=$(curl -sf http://localhost:10212/tokens)
 TOKEN_COUNT=$(echo "$LIST_RESPONSE" | python3 -c "import sys,json; print(len(json.load(sys.stdin)))")
 
 if [ "$TOKEN_COUNT" -gt 0 ]; then
-    pass "test 7: list tokens returned $TOKEN_COUNT tokens"
+    pass "test 6: list tokens returned $TOKEN_COUNT tokens"
 else
-    fail "test 7: expected tokens in list, got $TOKEN_COUNT"
+    fail "test 6: expected tokens in list, got $TOKEN_COUNT"
 fi
 
-# --- Test 8: No-destination token (wildcard) ---
-info "test 8: token with no destination restriction"
+# --- Test 7: No-destination token (wildcard) ---
+info "test 7: token with no destination restriction"
 WILDCARD_TOKEN=$(curl -sf -X POST http://localhost:10212/tokens \
     -d "{\"credential\":\"$CRED\",\"ttl_seconds\":60}" | \
     python3 -c "import sys,json; print(json.load(sys.stdin)['token'])")
@@ -239,13 +218,13 @@ RESPONSE=$(curl -s -w '\n%{http_code}' \
 STATUS=$(echo "$RESPONSE" | tail -n 1)
 
 if [ "$STATUS" = "200" ] || [ "$STATUS" = "401" ] || [ "$STATUS" = "400" ]; then
-    pass "test 8: wildcard token reached upstream (status=$STATUS)"
+    pass "test 7: wildcard token reached upstream (status=$STATUS)"
 else
-    fail "test 8: unexpected status $STATUS"
+    fail "test 7: unexpected status $STATUS"
 fi
 
-# --- Test 9: Readonly policy blocks POST ---
-info "test 9: readonly policy blocks POST requests"
+# --- Test 8: Readonly policy blocks POST ---
+info "test 8: readonly policy blocks POST requests"
 READONLY_TOKEN=$(curl -sf -X POST http://localhost:10212/tokens \
     -d "{\"credential\":\"$CRED\",\"destinations\":[\"api.anthropic.com\"],\"ttl_seconds\":60,\"policy\":\"readonly\"}" | \
     python3 -c "import sys,json; print(json.load(sys.stdin)['token'])")
@@ -260,24 +239,24 @@ STATUS=$(curl -s -o /dev/null -w '%{http_code}' \
     -d '{"model":"claude-sonnet-4-20250514","max_tokens":5,"messages":[{"role":"user","content":"hi"}]}')
 
 if [ "$STATUS" = "403" ]; then
-    pass "test 9: readonly policy blocked POST"
+    pass "test 8: readonly policy blocked POST"
 else
-    fail "test 9: expected 403, got $STATUS"
+    fail "test 8: expected 403, got $STATUS"
 fi
 
-# --- Test 10: List policies ---
-info "test 10: list policies returns built-in policies"
+# --- Test 9: List policies ---
+info "test 9: list policies returns built-in policies"
 POLICY_COUNT=$(curl -sf http://localhost:10212/policies | \
     python3 -c "import sys,json; print(len(json.load(sys.stdin)))")
 
 if [ "$POLICY_COUNT" -ge 4 ]; then
-    pass "test 10: list policies returned $POLICY_COUNT policies"
+    pass "test 9: list policies returned $POLICY_COUNT policies"
 else
-    fail "test 10: expected at least 4 policies, got $POLICY_COUNT"
+    fail "test 9: expected at least 4 policies, got $POLICY_COUNT"
 fi
 
-# --- Test 11: Basic auth token swap (git-style) ---
-info "test 11: Basic auth header with kf_ token"
+# --- Test 10: Basic auth token swap (git-style) ---
+info "test 10: Basic auth header with kf_ token"
 BASIC_TOKEN=$(curl -sf -X POST http://localhost:10212/tokens \
     -d "{\"credential\":\"$CRED\",\"destinations\":[\"api.anthropic.com\"],\"ttl_seconds\":60}" | \
     python3 -c "import sys,json; print(json.load(sys.stdin)['token'])")
@@ -299,13 +278,13 @@ STATUS=$(echo "$RESPONSE" | tail -n 1)
 # The token swap should work — Anthropic will reject Basic auth format,
 # but a non-proxy error (401/400) means the swap happened and reached upstream
 if [ "$STATUS" = "200" ] || [ "$STATUS" = "401" ] || [ "$STATUS" = "400" ]; then
-    pass "test 11: Basic auth token swap reached upstream (status=$STATUS)"
+    pass "test 10: Basic auth token swap reached upstream (status=$STATUS)"
 else
-    fail "test 11: expected upstream response, got $STATUS"
+    fail "test 10: expected upstream response, got $STATUS"
 fi
 
-# --- Test 12: Per-token rate limiting ---
-info "test 12: per-token rate limit (2 req/60s)"
+# --- Test 11: Per-token rate limiting ---
+info "test 11: per-token rate limit (2 req/60s)"
 RATE_TOKEN=$(curl -sf -X POST http://localhost:10212/tokens \
     -d "{\"credential\":\"$CRED\",\"destinations\":[\"api.anthropic.com\"],\"ttl_seconds\":60,\"rate_limit\":2,\"rate_window_seconds\":60}" | \
     python3 -c "import sys,json; print(json.load(sys.stdin)['token'])")
@@ -321,7 +300,7 @@ for i in 1 2; do
         -H "anthropic-version: 2023-06-01" \
         -d '{"model":"claude-sonnet-4-20250514","max_tokens":5,"messages":[{"role":"user","content":"hi"}]}')
     if [ "$STATUS" = "429" ]; then
-        fail "test 12: request $i should not be rate-limited, got 429"
+        fail "test 11: request $i should not be rate-limited, got 429"
         break
     fi
 done
@@ -337,9 +316,9 @@ STATUS=$(curl -s -o /dev/null -w '%{http_code}' \
     -d '{"model":"claude-sonnet-4-20250514","max_tokens":5,"messages":[{"role":"user","content":"hi"}]}')
 
 if [ "$STATUS" = "429" ]; then
-    pass "test 12: per-token rate limit enforced (429 on 3rd request)"
+    pass "test 11: per-token rate limit enforced (429 on 3rd request)"
 else
-    fail "test 12: expected 429, got $STATUS"
+    fail "test 11: expected 429, got $STATUS"
 fi
 
 echo ""

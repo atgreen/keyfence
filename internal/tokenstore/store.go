@@ -26,6 +26,8 @@ type Token struct {
 	TaskID              string        // orchestrator-assigned task scope
 	RateLimit           int           // max requests per window; 0 = unlimited
 	RateWindow          time.Duration // window duration
+	ClientCertID        string        // reference to cert+key in cert store
+	ClientCertHeader    string        // header to inject cert PEM into (optional)
 	CreatedAt           time.Time
 	ExpiresAt           time.Time
 	Label               string // optional human-readable label
@@ -78,6 +80,8 @@ type IssueParams struct {
 	TaskID              string
 	RateLimit           int
 	RateWindow          time.Duration
+	ClientCertID        string
+	ClientCertHeader    string
 }
 
 func (s *Store) Issue(p IssueParams) (*Token, error) {
@@ -99,6 +103,8 @@ func (s *Store) Issue(p IssueParams) (*Token, error) {
 		TaskID:              p.TaskID,
 		RateLimit:           p.RateLimit,
 		RateWindow:          p.RateWindow,
+		ClientCertID:        p.ClientCertID,
+		ClientCertHeader:    p.ClientCertHeader,
 		CreatedAt:           now,
 		ExpiresAt:           now.Add(p.TTL),
 		Label:               p.Label,

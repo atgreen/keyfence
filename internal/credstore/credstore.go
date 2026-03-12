@@ -62,6 +62,46 @@ func (e *EnvBackend) Fetch(id string) (string, error) {
 	return val, nil
 }
 
+// ClientCert holds a PEM-encoded client certificate and private key.
+type ClientCert struct {
+	CertPEM string
+	KeyPEM  string
+}
+
+// CertStore stores client certificate/key pairs in memory.
+type CertStore struct {
+	mu    sync.RWMutex
+	certs map[string]*ClientCert
+	seq   int
+}
+
+func NewCertStore() *CertStore {
+	return &CertStore{
+		certs: make(map[string]*ClientCert),
+	}
+}
+
+func (c *CertStore) Store(certPEM, keyPEM string) (string, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.seq++
+	id := fmt.Sprintf("cert_%d", c.seq)
+	c.certs[id] = &ClientCert{CertPEM: certPEM, KeyPEM: keyPEM}
+	return id, nil
+}
+
+func (c *CertStore) Fetch(id string) (*ClientCert, error) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	cert, ok := c.certs[id]
+	if !ok {
+		return nil, fmt.Errorf("client cert %q not found", id)
+	}
+	return cert, nil
+}
+
 // EnvMappedBackend reads credentials from environment variables.
 // Credential IDs are environment variable names.
 type EnvMappedBackend struct{}
