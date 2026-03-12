@@ -8,7 +8,6 @@ import (
 	"crypto/tls"
 	"encoding/base64"
 	"fmt"
-	"io"
 	"log"
 	"net"
 	"net/http"
@@ -39,19 +38,19 @@ type Proxy struct {
 	ca     *CA
 	store  *tokenstore.Store
 	creds  credstore.Backend
+	certs  *credstore.CertStore
 	policy *policy.Engine
-	dlp    *DLPScanner
 	audit  *audit.Logger
 	addr   string
 }
 
-func New(addr string, ca *CA, store *tokenstore.Store, creds credstore.Backend, pol *policy.Engine, dlp *DLPScanner, auditLog *audit.Logger) *Proxy {
+func New(addr string, ca *CA, store *tokenstore.Store, creds credstore.Backend, certs *credstore.CertStore, pol *policy.Engine, auditLog *audit.Logger) *Proxy {
 	return &Proxy{
 		ca:     ca,
 		store:  store,
 		creds:  creds,
+		certs:  certs,
 		policy: pol,
-		dlp:    dlp,
 		audit:  auditLog,
 		addr:   addr,
 	}
@@ -224,53 +223,49 @@ func (p *Proxy) processRequest(clientConn net.Conn, req *http.Request, targetHos
 		}
 	}
 
-	// DLP: scan request body
-	if req.Body != nil && p.dlp != nil {
-		body, err := io.ReadAll(io.LimitReader(req.Body, int64(p.dlp.maxBytes+1)))
+	// Fetch and swap header credential (if token has one)
+	if token.CredentialID != "" {
+		realCredential, err := p.creds.Fetch(token.CredentialID)
 		if err != nil {
-			writeError(clientConn, 502, "reading request body")
-			return
-		}
-		req.Body.Close()
-
-		if result := p.dlp.Scan(body); result != nil && result.Matched {
-			p.audit.Log(audit.Entry{
-				Event:       audit.EventDeny,
-				TokenID:     token.ID,
-				AgentID:     token.AgentID,
-				TaskID:      token.TaskID,
-				Destination: targetHost,
-				Method:      req.Method,
-				Path:        req.URL.Path,
-				DenyRule:    "dlp:" + result.PatternName,
-				DenyReason:  fmt.Sprintf("credential pattern detected (%s)", result.PatternName),
-			})
-			writeError(clientConn, 403, fmt.Sprintf("request blocked: credential pattern detected (%s)", result.PatternName))
+			log.Printf("credential fetch error: %v", err)
+			writeError(clientConn, 500, "failed to fetch credential")
 			return
 		}
 
-		req.Body = io.NopCloser(strings.NewReader(string(body)))
-		req.ContentLength = int64(len(body))
+		currentVal := req.Header.Get(tokenHeader)
+		if strings.HasPrefix(currentVal, "Basic ") {
+			decoded, _ := base64.StdEncoding.DecodeString(strings.TrimPrefix(currentVal, "Basic "))
+			swapped := strings.Replace(string(decoded), tokenValue, realCredential, 1)
+			req.Header.Set(tokenHeader, "Basic "+base64.StdEncoding.EncodeToString([]byte(swapped)))
+		} else {
+			newVal := strings.Replace(currentVal, tokenValue, realCredential, 1)
+			req.Header.Set(tokenHeader, newVal)
+		}
 	}
 
-	// Fetch real credential from backend
-	realCredential, err := p.creds.Fetch(token.CredentialID)
-	if err != nil {
-		log.Printf("credential fetch error: %v", err)
-		writeError(clientConn, 500, "failed to fetch credential")
-		return
-	}
+	// Fetch client cert (if token has one)
+	var clientTLSCert *tls.Certificate
+	if token.ClientCertID != "" && p.certs != nil {
+		cc, err := p.certs.Fetch(token.ClientCertID)
+		if err != nil {
+			log.Printf("client cert fetch error: %v", err)
+			writeError(clientConn, 500, "failed to fetch client certificate")
+			return
+		}
 
-	// Swap: replace kf_ token with real credential in the same header
-	currentVal := req.Header.Get(tokenHeader)
-	if strings.HasPrefix(currentVal, "Basic ") {
-		// Re-encode Basic auth with real credential swapped in
-		decoded, _ := base64.StdEncoding.DecodeString(strings.TrimPrefix(currentVal, "Basic "))
-		swapped := strings.Replace(string(decoded), tokenValue, realCredential, 1)
-		req.Header.Set(tokenHeader, "Basic "+base64.StdEncoding.EncodeToString([]byte(swapped)))
-	} else {
-		newVal := strings.Replace(currentVal, tokenValue, realCredential, 1)
-		req.Header.Set(tokenHeader, newVal)
+		// Inject cert PEM into header if configured
+		if token.ClientCertHeader != "" {
+			req.Header.Set(token.ClientCertHeader, cc.CertPEM)
+		}
+
+		// Parse for mTLS on the upstream connection
+		tlsCert, err := tls.X509KeyPair([]byte(cc.CertPEM), []byte(cc.KeyPEM))
+		if err != nil {
+			log.Printf("client cert parse error: %v", err)
+			writeError(clientConn, 500, "invalid client certificate")
+			return
+		}
+		clientTLSCert = &tlsCert
 	}
 
 	p.audit.Log(audit.Entry{
@@ -285,7 +280,7 @@ func (p *Proxy) processRequest(clientConn net.Conn, req *http.Request, targetHos
 	})
 
 	// Forward to upstream
-	upstreamResp, err := p.forwardRequest(req, targetHost)
+	upstreamResp, err := p.forwardRequest(req, targetHost, clientTLSCert)
 	if err != nil {
 		log.Printf("upstream error: %v", err)
 		writeError(clientConn, 502, fmt.Sprintf("upstream error: %v", err))
@@ -298,11 +293,16 @@ func (p *Proxy) processRequest(clientConn net.Conn, req *http.Request, targetHos
 	}
 }
 
-func (p *Proxy) forwardRequest(req *http.Request, host string) (*http.Response, error) {
+func (p *Proxy) forwardRequest(req *http.Request, host string, clientCert *tls.Certificate) (*http.Response, error) {
+	tlsConfig := &tls.Config{
+		ServerName: host,
+	}
+	if clientCert != nil {
+		tlsConfig.Certificates = []tls.Certificate{*clientCert}
+	}
+
 	transport := &http.Transport{
-		TLSClientConfig: &tls.Config{
-			ServerName: host,
-		},
+		TLSClientConfig: tlsConfig,
 		TLSHandshakeTimeout:   10 * time.Second,
 		ResponseHeaderTimeout: 30 * time.Second,
 	}

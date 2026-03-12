@@ -54,7 +54,6 @@ func main() {
 	apiAddr := flag.String("api", ":10212", "token management API listen address")
 	dataDir := flag.String("data-dir", defaultDataDir(), "data directory for CA certs")
 	certsDir := flag.String("certs-dir", "", "directory to export CA cert for agents (optional)")
-	dlpMaxBytes := flag.Int("dlp-max-bytes", 1048576, "max request body size for DLP scanning")
 	apiKey := flag.String("api-key", "", "require this Bearer token on all control API requests (strongly recommended)")
 	flag.Parse()
 
@@ -77,8 +76,8 @@ func main() {
 
 	store := tokenstore.New()
 	creds := credstore.NewEnvBackend()
+	certs := credstore.NewCertStore()
 	pol := policy.NewEngine()
-	dlp := proxy.NewDLPScanner(*dlpMaxBytes)
 
 	// Register built-in policies
 	pol.Register(&policy.Policy{
@@ -105,7 +104,7 @@ func main() {
 	})
 
 	// Start proxy
-	p := proxy.New(*proxyAddr, ca, store, creds, pol, dlp, auditLog)
+	p := proxy.New(*proxyAddr, ca, store, creds, certs, pol, auditLog)
 	go func() {
 		if err := p.ListenAndServe(); err != nil {
 			log.Fatalf("proxy: %v", err)
@@ -120,7 +119,7 @@ func main() {
 
 	// Token management API
 	mux := http.NewServeMux()
-	mux.HandleFunc("POST /tokens", requireAPIKey(*apiKey, handleIssueToken(store, creds, auditLog)))
+	mux.HandleFunc("POST /tokens", requireAPIKey(*apiKey, handleIssueToken(store, creds, certs, auditLog)))
 	mux.HandleFunc("GET /tokens", requireAPIKey(*apiKey, handleListTokens(store)))
 	mux.HandleFunc("DELETE /tokens/{token}", requireAPIKey(*apiKey, handleRevokeToken(store, auditLog)))
 	mux.HandleFunc("DELETE /tasks/{task_id}/tokens", requireAPIKey(*apiKey, handleRevokeByTask(store, auditLog)))
@@ -174,6 +173,9 @@ type issueRequest struct {
 	TaskID            string   `json:"task_id"`
 	RateLimit         int      `json:"rate_limit"`
 	RateWindowSeconds int      `json:"rate_window_seconds"`
+	ClientCert        string   `json:"client_cert"`
+	ClientKey         string   `json:"client_key"`
+	ClientCertHeader  string   `json:"client_cert_header"`
 }
 
 type issueResponse struct {
@@ -186,23 +188,42 @@ type issueResponse struct {
 	TaskID       string   `json:"task_id,omitempty"`
 }
 
-func handleIssueToken(store *tokenstore.Store, creds credstore.Backend, auditLog *audit.Logger) http.HandlerFunc {
+func handleIssueToken(store *tokenstore.Store, creds credstore.Backend, certStore *credstore.CertStore, auditLog *audit.Logger) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var req issueRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			http.Error(w, fmt.Sprintf(`{"error":"invalid json: %s"}`, err), 400)
 			return
 		}
-		if req.Credential == "" {
-			http.Error(w, `{"error":"credential is required"}`, 400)
+		if req.Credential == "" && req.ClientCert == "" {
+			http.Error(w, `{"error":"credential or client_cert is required"}`, 400)
 			return
 		}
 
-		// Store the real credential in the backend, get a reference ID
-		credID, err := creds.Store(req.Credential)
-		if err != nil {
-			http.Error(w, fmt.Sprintf(`{"error":"storing credential: %s"}`, err), 500)
-			return
+		// Store the header credential (if provided)
+		var credID string
+		if req.Credential != "" {
+			var err error
+			credID, err = creds.Store(req.Credential)
+			if err != nil {
+				http.Error(w, fmt.Sprintf(`{"error":"storing credential: %s"}`, err), 500)
+				return
+			}
+		}
+
+		// Store the client cert+key (if provided)
+		var clientCertID string
+		if req.ClientCert != "" {
+			if req.ClientKey == "" {
+				http.Error(w, `{"error":"client_key is required when client_cert is provided"}`, 400)
+				return
+			}
+			var err error
+			clientCertID, err = certStore.Store(req.ClientCert, req.ClientKey)
+			if err != nil {
+				http.Error(w, fmt.Sprintf(`{"error":"storing client cert: %s"}`, err), 500)
+				return
+			}
 		}
 
 		ttl := time.Duration(req.TTLSeconds) * time.Second
@@ -222,6 +243,8 @@ func handleIssueToken(store *tokenstore.Store, creds credstore.Backend, auditLog
 			TaskID:              req.TaskID,
 			RateLimit:           req.RateLimit,
 			RateWindow:          rateWindow,
+			ClientCertID:        clientCertID,
+			ClientCertHeader:    req.ClientCertHeader,
 		})
 		if err != nil {
 			http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err), 500)

@@ -19,10 +19,10 @@ raw secrets.
 cmd/keyfence/main.go          Entry point, CLI flags, HTTP API handlers
 internal/proxy/proxy.go        MITM forward proxy (CONNECT tunneling, token swap)
 internal/proxy/ca.go           Local ECDSA P-256 CA, on-the-fly cert generation
-internal/proxy/dlp.go          DLP scanner (regex credential detection)
 internal/tokenstore/store.go   In-memory token store (issue, resolve, revoke)
-internal/credstore/credstore.go Credential backend interface + implementations
+internal/credstore/credstore.go Credential backend + cert store (header creds, client certs)
 internal/policy/policy.go      Policy engine (methods, paths, rate limits, budgets)
+internal/audit/audit.go        Structured JSON audit logging
 examples/claude-github/        Worked example: Claude Code + GitHub PAT
 ```
 
@@ -47,7 +47,7 @@ There are no unit tests yet. All testing is via `scripts/test.sh`, which:
 
 1. Builds the binary
 2. Starts keyfence on `:10210` (proxy) and `:10212` (API)
-3. Runs 11 integration tests against the live process
+3. Runs integration tests against the live process
 4. Cleans up on exit
 
 Tests require `curl` and `python3` on PATH. Set `ANTHROPIC_API_KEY` for
@@ -70,7 +70,8 @@ and 401s from Anthropic are expected and accepted.
   The credential backend fetches the real value on each request.
 - Token prefix is `kf_` followed by 32 hex chars.
 - The local CA generates per-hostname TLS certs on the fly.
-- DLP scanning is regex-based and runs on request bodies before forwarding.
+- Client certificates for mTLS upstreams are held by KeyFence; agents never possess private keys.
+- All proxy actions emit structured JSON audit logs with token_id, agent_id, and task_id.
 
 ## Git conventions
 
