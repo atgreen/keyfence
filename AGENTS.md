@@ -22,7 +22,7 @@ internal/proxy/ca.go           Local ECDSA P-256 CA, on-the-fly cert generation
 internal/tokenstore/store.go   In-memory token store (issue, resolve, revoke)
 internal/credstore/credstore.go Credential backend (API keys, client certs, SSH keys)
 internal/policy/policy.go      Policy engine (methods, paths, rate limits, budgets)
-internal/sshproxy/sshproxy.go  SSH bastion (TCP forwarding, SSH key injection)
+internal/sshproxy/sshproxy.go  SSH bastion (SSH key injection)
 internal/luaengine/engine.go   Sandboxed Lua VM pool for response rule evaluation
 internal/luaengine/convert.go  Go/Lua bidirectional type conversion
 internal/telemetry/telemetry.go OpenTelemetry tracing initialization
@@ -79,9 +79,9 @@ and 401s from Anthropic are expected and accepted.
 - Token prefix is `kf_` followed by 32 hex chars.
 - The local CA generates per-hostname TLS certs on the fly.
 - Client certificates for mTLS upstreams are held by KeyFence; agents never possess private keys.
-- SSH bastion authenticates agents with kf_ tokens. Two modes:
-  - TCP forwarding (direct-tcpip): any protocol, destination-enforced, bytes untouched.
-  - SSH key injection (session exec): KeyFence holds real SSH key, bridges session upstream.
+- SSH bastion authenticates agents with kf_ tokens. KeyFence holds the real SSH
+  private key and bridges exec sessions to the upstream host. The agent never
+  has the key.
 - Destinations support host-only (`api.example.com`) or host+path (`api.example.com/v1/*`)
   with glob matching. Fully backward compatible.
 - Credentials can be rotated via `PUT /credentials/{id}` without invalidating tokens.

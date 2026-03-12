@@ -3,20 +3,13 @@
 
 // Package sshproxy implements an SSH bastion for KeyFence.
 //
-// It serves two purposes:
+// The bastion provides SSH key injection: the agent authenticates with
+// a kf_ token (as the SSH password), and KeyFence holds the real SSH
+// private key, authenticating to the upstream SSH server on the agent's
+// behalf. The agent never has the key.
 //
-//  1. TCP forwarding (direct-tcpip): Forward any protocol to allowed
-//     destinations. The agent uses ssh -L or -W to tunnel postgres,
-//     gRPC, raw TCP, etc. KeyFence enforces destination policy but
-//     doesn't touch the bytes.
-//
-//  2. SSH key injection (session + exec): For SSH-based upstreams like
-//     git, KeyFence holds the real private key and authenticates
-//     upstream on the agent's behalf. The agent never has the key.
-//
-// In both cases the agent authenticates to the bastion with a kf_ token
-// (as the SSH password). The token's AllowedDestinations controls which
-// hosts the agent can reach.
+// This is the SSH equivalent of the HTTPS proxy's credential swap —
+// the agent uses an opaque token, KeyFence injects the real credential.
 package sshproxy
 
 import (
@@ -44,8 +37,8 @@ import (
 	"github.com/keyfence/keyfence/internal/tokenstore"
 )
 
-// Server is an SSH bastion that validates kf_ tokens and provides
-// TCP forwarding and SSH session bridging.
+// Server is an SSH bastion that validates kf_ tokens and bridges
+// SSH sessions with real credentials.
 type Server struct {
 	addr    string
 	store   *tokenstore.Store
@@ -95,8 +88,6 @@ func (s *Server) ListenAndServe() error {
 
 // passwordCallback validates the kf_ token supplied as the SSH password.
 // Also checks the username for a kf_ prefix as a fallback.
-// Tokens do NOT require an SSH key — tokens without one can still use
-// TCP forwarding (direct-tcpip).
 func (s *Server) passwordCallback(meta ssh.ConnMetadata, password []byte) (*ssh.Permissions, error) {
 	tokenValue := string(password)
 
@@ -140,11 +131,9 @@ func (s *Server) handleConn(conn net.Conn) {
 
 	for newChan := range chans {
 		switch newChan.ChannelType() {
-		case "direct-tcpip":
-			go s.handleDirectTCPIP(token, tokenValue, newChan)
 		case "session":
 			if token.SSHKeyID == "" {
-				newChan.Reject(ssh.Prohibited, "token has no ssh key; use TCP forwarding (-L or -W) instead")
+				newChan.Reject(ssh.Prohibited, "token has no ssh key")
 				continue
 			}
 			channel, requests, err := newChan.Accept()
@@ -156,108 +145,6 @@ func (s *Server) handleConn(conn net.Conn) {
 			newChan.Reject(ssh.UnknownChannelType, "unsupported channel type")
 		}
 	}
-}
-
-// directTCPIPData is the payload for a direct-tcpip channel open request.
-type directTCPIPData struct {
-	DestHost   string
-	DestPort   uint32
-	OriginHost string
-	OriginPort uint32
-}
-
-// handleDirectTCPIP forwards arbitrary TCP connections to allowed destinations.
-// The agent uses ssh -L (local forward) or ssh -W (stdio forward) to tunnel
-// any protocol through KeyFence.
-func (s *Server) handleDirectTCPIP(token *tokenstore.Token, tokenValue string, newChan ssh.NewChannel) {
-	ctx, span := telemetry.Tracer().Start(context.Background(), "ssh.forward",
-		telemetry.WithSpanAttributes(
-			attribute.String("keyfence.token_id", token.ID),
-			attribute.String("keyfence.agent_id", token.AgentID),
-			attribute.String("keyfence.task_id", token.TaskID),
-		),
-	)
-	defer span.End()
-	_ = ctx
-
-	var req directTCPIPData
-	if err := ssh.Unmarshal(newChan.ExtraData(), &req); err != nil {
-		newChan.Reject(ssh.ConnectionFailed, "invalid forward request")
-		return
-	}
-
-	dest := net.JoinHostPort(req.DestHost, fmt.Sprintf("%d", req.DestPort))
-	span.SetAttributes(attribute.String("net.peer.name", dest))
-
-	// Check rate limit
-	if token.RateLimit > 0 && !s.store.CheckRate(tokenValue) {
-		s.audit.Log(audit.Entry{
-			Event:       audit.EventSSHDeny,
-			TokenID:     token.ID,
-			AgentID:     token.AgentID,
-			TaskID:      token.TaskID,
-			Destination: dest,
-			DenyRule:    "rate_limit",
-			DenyReason:  fmt.Sprintf("token rate limit exceeded: %d per %s", token.RateLimit, token.RateWindow),
-		})
-		span.SetStatus(codes.Error, "rate_limit")
-		newChan.Reject(ssh.ConnectionFailed, "rate limit exceeded")
-		return
-	}
-
-	// Check destination
-	if !token.IsDestinationAllowed(req.DestHost, "") {
-		s.audit.Log(audit.Entry{
-			Event:       audit.EventSSHDeny,
-			TokenID:     token.ID,
-			AgentID:     token.AgentID,
-			TaskID:      token.TaskID,
-			Destination: dest,
-			DenyRule:    "destination",
-			DenyReason:  fmt.Sprintf("token not allowed for destination %s", req.DestHost),
-		})
-		span.SetStatus(codes.Error, "destination_denied")
-		newChan.Reject(ssh.Prohibited, fmt.Sprintf("destination %s not allowed", req.DestHost))
-		return
-	}
-
-	// Dial upstream
-	upstream, err := net.DialTimeout("tcp", dest, 10*1e9) // 10 seconds
-	if err != nil {
-		s.audit.Log(audit.Entry{
-			Event:       audit.EventSSHDeny,
-			TokenID:     token.ID,
-			AgentID:     token.AgentID,
-			TaskID:      token.TaskID,
-			Destination: dest,
-			DenyRule:    "upstream_error",
-			DenyReason:  fmt.Sprintf("dial %s: %v", dest, err),
-		})
-		newChan.Reject(ssh.ConnectionFailed, "upstream connection failed")
-		return
-	}
-	defer upstream.Close()
-
-	channel, _, err := newChan.Accept()
-	if err != nil {
-		return
-	}
-	defer channel.Close()
-
-	s.audit.Log(audit.Entry{
-		Event:       audit.EventSSHAllow,
-		TokenID:     token.ID,
-		AgentID:     token.AgentID,
-		TaskID:      token.TaskID,
-		Destination: dest,
-	})
-
-	// Bridge bytes in both directions
-	var wg sync.WaitGroup
-	wg.Add(2)
-	go func() { defer wg.Done(); io.Copy(upstream, channel) }()
-	go func() { defer wg.Done(); io.Copy(channel, upstream) }()
-	wg.Wait()
 }
 
 // handleSession handles SSH session channels for exec requests.
