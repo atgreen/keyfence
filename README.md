@@ -9,7 +9,7 @@ KeyFence is a single-binary proxy that sits between AI agents and the services t
 - **Enforce policies** — restrict HTTP methods, content types, body sizes, and rate limits per token.
 - **Set usage budgets with Lua scripting** — attach Lua scripts that inspect upstream JSON responses, accumulate metrics like LLM token usage across requests, and automatically revoke a token when a budget is exceeded.
 - **Rotate credentials without disruption** — swap the underlying secret and all tokens pick up the new value on their next request. No reissuance needed.
-- **Tunnel any protocol** — forward postgres, gRPC, or any TCP traffic through the SSH bastion with destination enforcement.
+- **Tunnel any protocol** — forward postgres, gRPC, or any TCP traffic through the KeyFence proxy with destination enforcement.
 - **Monitor everything in real-time** — structured audit logs, Server-Sent Events stream, webhook delivery, and OpenTelemetry distributed tracing on every request.
 - **Enforce egress at the network level** — containerized agents run on an isolated network with no internet access. All traffic must transit KeyFence.
 
