@@ -1,0 +1,143 @@
+# Claude Code + GitHub via KeyFence
+#
+# KeyFence proxies HTTPS requests from the Claude container to GitHub,
+# swapping the kf_ token for the real GitHub PAT. The Claude container
+# is on an isolated network with no direct internet access.
+#
+# Usage:
+#   1. Start KeyFence:
+#      docker compose up -d keyfence
+#
+#   2. Issue a token (see setup.sh or README.md)
+#
+#   3. Run Claude:
+#      KEYFENCE_TOKEN=kf_... docker compose run --rm claude
+
+services:
+  keyfence:
+    build:
+      context: ../../
+      dockerfile: Containerfile
+    networks:
+      - default              # outbound internet (reaches github.com)
+      - agent-isolated       # reachable by claude container
+    ports:
+      - "10212:10212"        # control API (host-facing only)
+    volumes:
+      - keyfence-data:/data
+      - keyfence-certs:/certs
+    command: ["--data-dir", "/data", "--certs-dir", "/certs"]
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:10212/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+
+  claude:
+    build:
+      context: .
+      dockerfile_inline: |
+        FROM docker.io/alpine:3.20
+        RUN apk add --no-cache curl git openssh-client
+        # Install GitHub CLI
+        RUN apk add --no-cache --repository=https://dl-cdn.alpinelinux.org/alpine/edge/community gh
+    networks:
+      - agent-isolated       # NO default network = no direct internet
+    environment:
+      - HTTPS_PROXY=http://keyfence:10210
+      - SSL_CERT_FILE=/certs/ca.pem
+      - GITHUB_TOKEN=${KEYFENCE_TOKEN:-kf_not_set}
+      # gh CLI respects GITHUB_TOKEN and GH_HOST
+      - GH_HOST=github.com
+    volumes:
+      - keyfence-certs:/certs:ro   # CA cert only — no private key
+    depends_on:
+      keyfence:
+        condition: service_healthy
+    command:
+      - sh
+      - -c
+      - |
+        echo "============================================"
+        echo "  Claude Code + GitHub via KeyFence"
+        echo "============================================"
+        echo ""
+
+        # --- 1. Show that GITHUB_TOKEN is a kf_ token, not a real PAT ---
+        echo "=== 1. GITHUB_TOKEN is a KeyFence token ==="
+        echo "   GITHUB_TOKEN=$${GITHUB_TOKEN:0:20}..."
+        if echo "$$GITHUB_TOKEN" | grep -q '^kf_'; then
+          echo "   PASS: token starts with kf_ (not a real PAT)"
+        else
+          echo "   WARN: token does not start with kf_"
+        fi
+        echo ""
+
+        # --- 2. Verify direct internet access is blocked ---
+        echo "=== 2. Direct internet access is blocked ==="
+        if curl -sf --max-time 3 --noproxy '*' https://github.com >/dev/null 2>&1; then
+          echo "   FAIL: container can reach the internet directly!"
+          exit 1
+        else
+          echo "   PASS: direct internet access blocked (network is isolated)"
+        fi
+        echo ""
+
+        # --- 3. Verify CA private key is not accessible ---
+        echo "=== 3. CA private key is not in our volume ==="
+        if [ -f /certs/ca-key.pem ]; then
+          echo "   FAIL: CA private key is accessible!"
+          exit 1
+        else
+          echo "   PASS: CA private key not accessible"
+        fi
+        echo ""
+
+        # --- 4. Authenticate with GitHub via KeyFence proxy ---
+        echo "=== 4. GitHub authentication via KeyFence ==="
+        echo "   Running: gh api /user"
+        USER_JSON=$$(gh api /user 2>&1) || true
+        if echo "$$USER_JSON" | grep -q '"login"'; then
+          USER_LOGIN=$$(echo "$$USER_JSON" | grep '"login"' | head -1 | sed 's/.*: "//;s/".*//')
+          echo "   PASS: authenticated as $$USER_LOGIN"
+        else
+          echo "   Response: $$USER_JSON"
+          echo "   (If you see an auth error, make sure you issued a token with a valid GitHub PAT)"
+        fi
+        echo ""
+
+        # --- 5. Clone a repo via git through the proxy ---
+        echo "=== 5. Git clone via KeyFence proxy ==="
+        echo "   Running: git clone https://github.com/octocat/Hello-World.git /tmp/hello-world"
+        git clone --depth 1 https://github.com/octocat/Hello-World.git /tmp/hello-world 2>&1 && {
+          echo "   PASS: cloned successfully"
+          ls -la /tmp/hello-world/
+        } || {
+          echo "   Clone failed (check proxy logs for details)"
+        }
+        echo ""
+
+        # --- 6. Demonstrate destination policy enforcement ---
+        echo "=== 6. Non-GitHub hosts are blocked by token policy ==="
+        echo "   Running: curl https://api.openai.com/ (should be rejected)"
+        HTTP_CODE=$$(curl -s -o /dev/null -w '%{http_code}' \
+          --max-time 5 \
+          https://api.openai.com/ 2>&1) || true
+        if [ "$$HTTP_CODE" = "403" ] || [ "$$HTTP_CODE" = "000" ]; then
+          echo "   PASS: non-GitHub request blocked (HTTP $$HTTP_CODE)"
+        else
+          echo "   Got HTTP $$HTTP_CODE (expected 403 or connection refused)"
+        fi
+        echo ""
+        echo "============================================"
+        echo "  All checks complete."
+        echo "============================================"
+
+networks:
+  default: {}               # standard bridge — has outbound routing
+  agent-isolated:
+    internal: true           # no default gateway — claude cannot reach internet
+
+volumes:
+  keyfence-data:             # KeyFence data (CA key, token store) — NOT mounted by claude
+  keyfence-certs:            # CA cert only — mounted read-only by claude
