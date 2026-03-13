@@ -100,7 +100,7 @@ func (w *WebhookSink) deliver(e Entry) {
 
 		if w.Secret != "" {
 			mac := hmac.New(sha256.New, []byte(w.Secret))
-			mac.Write(body)
+			_, _ = mac.Write(body)
 			req.Header.Set("X-KeyFence-Signature", hex.EncodeToString(mac.Sum(nil)))
 		}
 
@@ -109,7 +109,7 @@ func (w *WebhookSink) deliver(e Entry) {
 			log.Printf("webhook delivery to %s failed: %v", w.URL, err)
 			continue
 		}
-		resp.Body.Close()
+		_ = resp.Body.Close()
 		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 			return
 		}
