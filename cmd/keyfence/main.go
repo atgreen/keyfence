@@ -404,7 +404,7 @@ func requireAPIKey(key string, next http.HandlerFunc) http.HandlerFunc {
 	expected := "Bearer " + key
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") != expected {
-			http.Error(w, `{"error":"unauthorized: invalid or missing api key"}`, 401)
+			http.Error(w, `{"error":"unauthorized: invalid or missing api key"}`, http.StatusUnauthorized)
 			return
 		}
 		next(w, r)
