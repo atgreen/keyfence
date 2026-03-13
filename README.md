@@ -491,7 +491,7 @@ make test        # run integration tests
 make clean       # remove build artifacts
 ```
 
-Requires Go 1.22+.
+Requires Go 1.25+.
 
 ## Author
 

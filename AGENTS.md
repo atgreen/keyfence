@@ -9,7 +9,7 @@ raw secrets.
 
 ## Tech stack
 
-- Go 1.22+
+- Go 1.25+
 - Dependencies: `golang.org/x/crypto` (SSH bastion), OpenTelemetry (optional tracing), `gopher-lua` (response rule scripting)
 - Container runtime: podman or docker
 
