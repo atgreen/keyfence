@@ -70,7 +70,7 @@ func main() {
 	if err != nil {
 		log.Printf("otel init (tracing disabled): %v", err)
 	} else {
-		defer otelShutdown(context.Background())
+		defer func() { _ = otelShutdown(context.Background()) }()
 	}
 
 	// Load or create local CA
@@ -162,7 +162,7 @@ func main() {
 	mux.HandleFunc("GET /events", requireAPIKey(*apiKey, sseSink.ServeHTTP))
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+		_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 	})
 
 	log.Printf("api on %s", *apiAddr)
@@ -318,7 +318,7 @@ func handleIssueToken(store *tokenstore.Store, creds credstore.Backend, certStor
 		})
 
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(issueResponse{
+		_ = json.NewEncoder(w).Encode(issueResponse{
 			Token:        token.Value,
 			ExpiresAt:    token.ExpiresAt.Format(time.RFC3339),
 			Destinations: token.AllowedDestinations,
@@ -357,7 +357,7 @@ func handleListTokens(store *tokenstore.Store) http.HandlerFunc {
 			})
 		}
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(result)
+		_ = json.NewEncoder(w).Encode(result)
 	}
 }
 
@@ -370,7 +370,7 @@ func handleRevokeToken(store *tokenstore.Store, auditLog *audit.Logger) http.Han
 				TokenID: tokenValue,
 			})
 			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(map[string]string{"status": "revoked"})
+			_ = json.NewEncoder(w).Encode(map[string]string{"status": "revoked"})
 		} else {
 			http.Error(w, `{"error":"token not found"}`, 404)
 		}
@@ -391,7 +391,7 @@ func handleRevokeByTask(store *tokenstore.Store, auditLog *audit.Logger) http.Ha
 			Label:  fmt.Sprintf("bulk revoke: %d tokens", count),
 		})
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]interface{}{"status": "revoked", "count": count})
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"status": "revoked", "count": count})
 	}
 }
 
@@ -423,7 +423,7 @@ func handleListPolicies(pol *policy.Engine) http.HandlerFunc {
 			result[i] = policyInfo{Name: n}
 		}
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(result)
+		_ = json.NewEncoder(w).Encode(result)
 	}
 }
 
@@ -454,7 +454,7 @@ func handleRotateCredential(creds credstore.Backend, store *tokenstore.Store, au
 			Label:        fmt.Sprintf("credential rotated, %d active tokens", count),
 		})
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]interface{}{
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
 			"status":          "rotated",
 			"credential_id":   id,
 			"affected_tokens": count,
@@ -487,7 +487,7 @@ func handleRotateCert(certs *credstore.CertStore, auditLog *audit.Logger) http.H
 			Label:        "client cert rotated",
 		})
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]string{"status": "rotated", "credential_id": id})
+		_ = json.NewEncoder(w).Encode(map[string]string{"status": "rotated", "credential_id": id})
 	}
 }
 
@@ -520,7 +520,7 @@ func handleRotateSSHKey(sshKeys *credstore.SSHKeyStore, auditLog *audit.Logger) 
 			Label:        "ssh key rotated",
 		})
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]string{"status": "rotated", "credential_id": id})
+		_ = json.NewEncoder(w).Encode(map[string]string{"status": "rotated", "credential_id": id})
 	}
 }
 
@@ -545,6 +545,6 @@ func handleRegisterWebhook(auditLog *audit.Logger) http.HandlerFunc {
 		auditLog.AddSink(wh)
 		go wh.Run()
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]string{"status": "registered", "url": req.URL})
+		_ = json.NewEncoder(w).Encode(map[string]string{"status": "registered", "url": req.URL})
 	}
 }

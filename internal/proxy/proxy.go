@@ -84,7 +84,7 @@ func (p *Proxy) ListenAndServe() error {
 }
 
 func (p *Proxy) handleConn(conn net.Conn) {
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	br := bufio.NewReader(conn)
 	req, err := http.ReadRequest(br)
@@ -142,7 +142,7 @@ func (p *Proxy) handleConnect(conn net.Conn, req *http.Request) {
 		span.SetStatus(codes.Error, "TLS handshake failed")
 		return
 	}
-	defer tlsConn.Close()
+	defer func() { _ = tlsConn.Close() }()
 
 	// Read the actual HTTP request inside the TLS tunnel
 	br := bufio.NewReader(tlsConn)
@@ -329,7 +329,7 @@ func (p *Proxy) processRequest(ctx context.Context, clientConn net.Conn, req *ht
 		writeError(clientConn, 502, fmt.Sprintf("upstream error: %v", err))
 		return
 	}
-	defer upstreamResp.Body.Close()
+	defer func() { _ = upstreamResp.Body.Close() }()
 
 	span.SetAttributes(attribute.Int("http.status_code", upstreamResp.StatusCode))
 
@@ -556,11 +556,11 @@ func writeError(conn net.Conn, status int, message string) {
 	body := fmt.Sprintf(`{"error":"%s"}`, message)
 	resp := fmt.Sprintf("HTTP/1.1 %d %s\r\nContent-Type: application/json\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s",
 		status, http.StatusText(status), len(body), body)
-	conn.Write([]byte(resp))
+	_, _ = conn.Write([]byte(resp))
 }
 
 func writeJSON(conn net.Conn, status int, body string) {
 	resp := fmt.Sprintf("HTTP/1.1 %d %s\r\nContent-Type: application/json\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s",
 		status, http.StatusText(status), len(body), body)
-	conn.Write([]byte(resp))
+	_, _ = conn.Write([]byte(resp))
 }

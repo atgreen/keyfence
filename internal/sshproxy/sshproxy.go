@@ -112,13 +112,13 @@ func (s *Server) passwordCallback(meta ssh.ConnMetadata, password []byte) (*ssh.
 }
 
 func (s *Server) handleConn(conn net.Conn) {
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	sshConn, chans, reqs, err := ssh.NewServerConn(conn, s.config)
 	if err != nil {
 		return
 	}
-	defer sshConn.Close()
+	defer func() { _ = sshConn.Close() }()
 
 	// Discard global requests
 	go ssh.DiscardRequests(reqs)
@@ -133,7 +133,7 @@ func (s *Server) handleConn(conn net.Conn) {
 		switch newChan.ChannelType() {
 		case "session":
 			if token.SSHKeyID == "" {
-				newChan.Reject(ssh.Prohibited, "token has no ssh key")
+				_ = newChan.Reject(ssh.Prohibited, "token has no ssh key")
 				continue
 			}
 			channel, requests, err := newChan.Accept()
@@ -142,7 +142,7 @@ func (s *Server) handleConn(conn net.Conn) {
 			}
 			go s.handleSession(token, tokenValue, channel, requests)
 		default:
-			newChan.Reject(ssh.UnknownChannelType, "unsupported channel type")
+			_ = newChan.Reject(ssh.UnknownChannelType, "unsupported channel type")
 		}
 	}
 }
@@ -151,36 +151,36 @@ func (s *Server) handleConn(conn net.Conn) {
 // This is used for SSH key injection — KeyFence holds the real SSH
 // private key and authenticates to the upstream SSH server.
 func (s *Server) handleSession(token *tokenstore.Token, tokenValue string, channel ssh.Channel, requests <-chan *ssh.Request) {
-	defer channel.Close()
+	defer func() { _ = channel.Close() }()
 
 	for req := range requests {
 		switch req.Type {
 		case "exec":
 			if len(req.Payload) < 4 {
-				req.Reply(false, nil)
+				_ = req.Reply(false, nil)
 				continue
 			}
 			// Payload is uint32 length + string
 			cmdLen := binary.BigEndian.Uint32(req.Payload[:4])
 			if int(cmdLen)+4 > len(req.Payload) {
-				req.Reply(false, nil)
+				_ = req.Reply(false, nil)
 				continue
 			}
 			command := string(req.Payload[4 : 4+cmdLen])
-			req.Reply(true, nil)
+			_ = req.Reply(true, nil)
 			s.bridgeSSHSession(token, tokenValue, channel, command)
 			return
 
 		case "env":
 			// Ignore env requests (git sends some)
 			if req.WantReply {
-				req.Reply(true, nil)
+				_ = req.Reply(true, nil)
 			}
 
 		default:
 			// Reject shell, pty-req, subsystem, etc.
 			if req.WantReply {
-				req.Reply(false, nil)
+				_ = req.Reply(false, nil)
 			}
 		}
 	}
@@ -211,7 +211,7 @@ func (s *Server) bridgeSSHSession(token *tokenstore.Token, tokenValue string, ch
 			DenyReason: fmt.Sprintf("token rate limit exceeded: %d per %s", token.RateLimit, token.RateWindow),
 		})
 		span.SetStatus(codes.Error, "rate_limit")
-		fmt.Fprintf(channel.Stderr(), "rate limit exceeded\r\n")
+		_, _ = fmt.Fprintf(channel.Stderr(), "rate limit exceeded\r\n")
 		sendExitStatus(channel, 1)
 		return
 	}
@@ -227,7 +227,7 @@ func (s *Server) bridgeSSHSession(token *tokenstore.Token, tokenValue string, ch
 			DenyRule:   "no_destination",
 			DenyReason: "ssh session requires allowed destinations",
 		})
-		fmt.Fprintf(channel.Stderr(), "ssh session requires allowed destinations\r\n")
+		_, _ = fmt.Fprintf(channel.Stderr(), "ssh session requires allowed destinations\r\n")
 		sendExitStatus(channel, 1)
 		return
 	}
@@ -243,7 +243,7 @@ func (s *Server) bridgeSSHSession(token *tokenstore.Token, tokenValue string, ch
 	sshKey, err := s.sshKeys.Fetch(token.SSHKeyID)
 	if err != nil {
 		log.Printf("ssh key fetch error: %v", err)
-		fmt.Fprintf(channel.Stderr(), "failed to fetch ssh key\r\n")
+		_, _ = fmt.Fprintf(channel.Stderr(), "failed to fetch ssh key\r\n")
 		sendExitStatus(channel, 1)
 		return
 	}
@@ -251,7 +251,7 @@ func (s *Server) bridgeSSHSession(token *tokenstore.Token, tokenValue string, ch
 	signer, err := ssh.ParsePrivateKey([]byte(sshKey.PrivateKeyPEM))
 	if err != nil {
 		log.Printf("ssh key parse error: %v", err)
-		fmt.Fprintf(channel.Stderr(), "invalid ssh key\r\n")
+		_, _ = fmt.Fprintf(channel.Stderr(), "invalid ssh key\r\n")
 		sendExitStatus(channel, 1)
 		return
 	}
@@ -275,20 +275,20 @@ func (s *Server) bridgeSSHSession(token *tokenstore.Token, tokenValue string, ch
 			DenyRule:    "upstream_error",
 			DenyReason:  fmt.Sprintf("upstream ssh dial: %v", err),
 		})
-		fmt.Fprintf(channel.Stderr(), "upstream connection failed\r\n")
+		_, _ = fmt.Fprintf(channel.Stderr(), "upstream connection failed\r\n")
 		sendExitStatus(channel, 1)
 		return
 	}
-	defer upstreamConn.Close()
+	defer func() { _ = upstreamConn.Close() }()
 
 	upstreamSession, err := upstreamConn.NewSession()
 	if err != nil {
 		log.Printf("upstream session error: %v", err)
-		fmt.Fprintf(channel.Stderr(), "upstream session failed\r\n")
+		_, _ = fmt.Fprintf(channel.Stderr(), "upstream session failed\r\n")
 		sendExitStatus(channel, 1)
 		return
 	}
-	defer upstreamSession.Close()
+	defer func() { _ = upstreamSession.Close() }()
 
 	s.audit.Log(audit.Entry{
 		Event:       audit.EventSSHAllow,
@@ -317,16 +317,16 @@ func (s *Server) bridgeSSHSession(token *tokenstore.Token, tokenValue string, ch
 	}
 
 	if err := upstreamSession.Start(command); err != nil {
-		fmt.Fprintf(channel.Stderr(), "upstream exec failed: %v\r\n", err)
+		_, _ = fmt.Fprintf(channel.Stderr(), "upstream exec failed: %v\r\n", err)
 		sendExitStatus(channel, 1)
 		return
 	}
 
 	var wg sync.WaitGroup
 	wg.Add(3)
-	go func() { defer wg.Done(); io.Copy(upstreamStdin, channel); upstreamStdin.Close() }()
-	go func() { defer wg.Done(); io.Copy(channel, upstreamStdout) }()
-	go func() { defer wg.Done(); io.Copy(channel.Stderr(), upstreamStderr) }()
+	go func() { defer wg.Done(); _, _ = io.Copy(upstreamStdin, channel); _ = upstreamStdin.Close() }()
+	go func() { defer wg.Done(); _, _ = io.Copy(channel, upstreamStdout) }()
+	go func() { defer wg.Done(); _, _ = io.Copy(channel.Stderr(), upstreamStderr) }()
 
 	exitCode := 0
 	if err := upstreamSession.Wait(); err != nil {
@@ -343,7 +343,7 @@ func (s *Server) bridgeSSHSession(token *tokenstore.Token, tokenValue string, ch
 func sendExitStatus(channel ssh.Channel, code int) {
 	payload := make([]byte, 4)
 	binary.BigEndian.PutUint32(payload, uint32(code))
-	channel.SendRequest("exit-status", false, payload)
+	_, _ = channel.SendRequest("exit-status", false, payload)
 }
 
 // loadOrCreateHostKey loads an Ed25519 host key from dir, or generates one.

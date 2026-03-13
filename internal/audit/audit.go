@@ -77,7 +77,7 @@ func (l *Logger) AddSink(s Sink) {
 func (l *Logger) Log(e Entry) {
 	e.Timestamp = time.Now().UTC().Format(time.RFC3339)
 	l.mu.Lock()
-	l.enc.Encode(e)
+	_ = l.enc.Encode(e)
 	sinks := append([]Sink(nil), l.sinks...)
 	l.mu.Unlock()
 	for _, s := range sinks {
