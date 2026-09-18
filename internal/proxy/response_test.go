@@ -210,3 +210,84 @@ func TestAResponseNobodyWillInspectIsNotBuffered(t *testing.T) {
 		t.Errorf("expected a quiet audit trail, got %d entries", len(entries))
 	}
 }
+
+// Keep-alive depends on the client being able to tell where a response ended.
+// A body delimited only by the connection closing costs every request after it.
+
+func TestFramingIsMadeDeterminateWhenUpstreamGivesNone(t *testing.T) {
+	// An HTTP/2 upstream response: no declared length, no chunked framing.
+	resp := &http.Response{
+		StatusCode:    http.StatusOK,
+		Proto:         "HTTP/2.0",
+		ProtoMajor:    2,
+		ContentLength: -1,
+		Header:        http.Header{},
+		Body:          io.NopCloser(strings.NewReader("hello")),
+	}
+
+	if framedDeterminately(resp) {
+		t.Fatal("a response with no length and no chunking was called determinate")
+	}
+	makeFramingDeterminate(resp)
+	if !framedDeterminately(resp) {
+		t.Error("the response was not made determinate, so the connection cannot be reused")
+	}
+	if resp.ProtoMajor != 1 || resp.ProtoMinor != 1 {
+		t.Errorf("written to the client as %s; it is serialized as HTTP/1.1", resp.Proto)
+	}
+}
+
+func TestADeclaredLengthIsLeftAlone(t *testing.T) {
+	resp := &http.Response{
+		StatusCode:    http.StatusOK,
+		Proto:         "HTTP/1.1",
+		ProtoMajor:    1,
+		ProtoMinor:    1,
+		ContentLength: 5,
+		Header:        http.Header{},
+		Body:          io.NopCloser(strings.NewReader("hello")),
+	}
+
+	makeFramingDeterminate(resp)
+	if len(resp.TransferEncoding) != 0 {
+		t.Errorf("a response with a length was chunked as well: %v", resp.TransferEncoding)
+	}
+	if !framedDeterminately(resp) {
+		t.Error("a declared length is determinate")
+	}
+}
+
+func TestAResponseTheUpstreamWantsClosedStaysClosed(t *testing.T) {
+	resp := &http.Response{
+		StatusCode:    http.StatusOK,
+		Proto:         "HTTP/1.1",
+		ProtoMajor:    1,
+		ProtoMinor:    1,
+		ContentLength: -1,
+		Close:         true,
+		Header:        http.Header{},
+		Body:          io.NopCloser(strings.NewReader("hello")),
+	}
+
+	makeFramingDeterminate(resp)
+	if framedDeterminately(resp) {
+		t.Error("an upstream that asked to close was reported as reusable")
+	}
+}
+
+func TestAnEmptyResponseIsNotChunked(t *testing.T) {
+	for _, status := range []int{http.StatusNoContent, http.StatusNotModified} {
+		resp := &http.Response{
+			StatusCode:    status,
+			Proto:         "HTTP/1.1",
+			ProtoMajor:    1,
+			ProtoMinor:    1,
+			ContentLength: -1,
+			Header:        http.Header{},
+		}
+		makeFramingDeterminate(resp)
+		if len(resp.TransferEncoding) != 0 {
+			t.Errorf("%d was given a chunked body it has no room for", status)
+		}
+	}
+}

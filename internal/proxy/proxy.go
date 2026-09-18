@@ -50,9 +50,15 @@ type Proxy struct {
 	certs  *credstore.CertStore
 	policy *policy.Engine
 	named  *credstore.NamedStore
-	audit  *audit.Logger
-	lua    *luaengine.Engine
-	addr   string
+
+	// One transport for upstream connections without a client certificate,
+	// which is nearly all of them. Building a transport per request meant a
+	// fresh TCP connection and TLS handshake every time, with the pool it
+	// maintains discarded immediately afterwards.
+	upstream *http.Transport
+	audit    *audit.Logger
+	lua      *luaengine.Engine
+	addr     string
 }
 
 func New(addr string, ca *CA, store *tokenstore.Store, creds credstore.Backend, certs *credstore.CertStore, pol *policy.Engine, auditLog *audit.Logger, named *credstore.NamedStore) *Proxy {
@@ -63,9 +69,20 @@ func New(addr string, ca *CA, store *tokenstore.Store, creds credstore.Backend, 
 		certs:  certs,
 		policy: pol,
 		named:  named,
-		audit:  auditLog,
-		lua:    luaengine.New(),
-		addr:   addr,
+		upstream: &http.Transport{
+			TLSHandshakeTimeout:   10 * time.Second,
+			ResponseHeaderTimeout: 30 * time.Second,
+			MaxIdleConnsPerHost:   8,
+			IdleConnTimeout:       90 * time.Second,
+			// HTTP/1.1 upstream deliberately. What reaches the client is
+			// re-serialized as HTTP/1.1 either way, and an HTTP/2 response
+			// arrives with neither a length nor chunked framing, so it would
+			// have to be buffered or re-chunked to be forwarded at all.
+			ForceAttemptHTTP2: false,
+		},
+		audit: auditLog,
+		lua:   luaengine.New(),
+		addr:  addr,
 	}
 }
 
@@ -153,22 +170,41 @@ func (p *Proxy) handleConnect(conn net.Conn, req *http.Request) {
 	}
 	defer func() { _ = tlsConn.Close() }()
 
-	// Read the actual HTTP request inside the TLS tunnel
+	// Read requests inside the TLS tunnel until the client stops sending them.
+	//
+	// One per tunnel was the old behaviour, which meant an agent making twenty
+	// API calls paid twenty TCP connections and twenty TLS handshakes -- to the
+	// proxy on loopback, and again to the upstream. HTTP/1.1 keep-alive is the
+	// client's default, and this honours it: a request is followed by another on
+	// the same connection unless one side says otherwise.
 	br := bufio.NewReader(tlsConn)
-	innerReq, err := http.ReadRequest(br)
-	if err != nil {
-		log.Printf("read inner request for %s: %v", hostname, err)
-		span.SetStatus(codes.Error, "read inner request")
-		return
-	}
-	innerReq.URL.Scheme = "https"
-	innerReq.URL.Host = hostname
+	for {
+		innerReq, err := http.ReadRequest(br)
+		if err != nil {
+			// EOF is the ordinary end of a keep-alive connection, not a fault.
+			if err != io.EOF {
+				log.Printf("read inner request for %s: %v", hostname, err)
+				span.SetStatus(codes.Error, "read inner request")
+			}
+			return
+		}
+		innerReq.URL.Scheme = "https"
+		innerReq.URL.Host = hostname
 
-	p.processRequest(ctx, tlsConn, innerReq, hostname)
+		if !p.processRequest(ctx, tlsConn, innerReq, hostname) {
+			return
+		}
+	}
 }
 
 // processRequest is the core: find token, validate, swap, forward.
-func (p *Proxy) processRequest(ctx context.Context, clientConn net.Conn, req *http.Request, targetHost string) {
+// processRequest is the core: find token, validate, swap, forward. It answers
+// whether the connection can carry another request afterwards.
+//
+// Anything that ends in an error answers false: the client is told what happened
+// and the connection closed, which is simpler to reason about than leaving a
+// tunnel open after a refusal.
+func (p *Proxy) processRequest(ctx context.Context, clientConn net.Conn, req *http.Request, targetHost string) bool {
 	_, span := telemetry.Tracer().Start(ctx, "proxy.request",
 		telemetry.WithSpanAttributes(
 			attribute.String("http.method", req.Method),
@@ -191,7 +227,7 @@ func (p *Proxy) processRequest(ctx context.Context, clientConn net.Conn, req *ht
 		})
 		span.SetStatus(codes.Error, "no_token")
 		writeError(clientConn, 401, "no keyfence token found in request headers")
-		return
+		return false
 	}
 
 	// Resolve token
@@ -207,7 +243,7 @@ func (p *Proxy) processRequest(ctx context.Context, clientConn net.Conn, req *ht
 		})
 		span.SetStatus(codes.Error, "invalid_token")
 		writeError(clientConn, 403, "invalid or expired keyfence token")
-		return
+		return false
 	}
 
 	span.SetAttributes(
@@ -232,7 +268,7 @@ func (p *Proxy) processRequest(ctx context.Context, clientConn net.Conn, req *ht
 		})
 		span.SetStatus(codes.Error, "rate_limit")
 		writeError(clientConn, 429, fmt.Sprintf("rate limit exceeded: %d requests per %s", token.RateLimit, token.RateWindow))
-		return
+		return false
 	}
 
 	// Check destination
@@ -250,7 +286,7 @@ func (p *Proxy) processRequest(ctx context.Context, clientConn net.Conn, req *ht
 		})
 		span.SetStatus(codes.Error, "destination_denied")
 		writeError(clientConn, 403, fmt.Sprintf("token not allowed for destination %s", targetHost))
-		return
+		return false
 	}
 
 	// Policy check
@@ -270,7 +306,7 @@ func (p *Proxy) processRequest(ctx context.Context, clientConn net.Conn, req *ht
 			})
 			span.SetStatus(codes.Error, "policy_denied: "+deny.Rule)
 			writeError(clientConn, 403, deny.Message)
-			return
+			return false
 		}
 	}
 
@@ -280,7 +316,7 @@ func (p *Proxy) processRequest(ctx context.Context, clientConn net.Conn, req *ht
 		if err != nil {
 			log.Printf("credential fetch error: %v", err)
 			writeError(clientConn, 500, "failed to fetch credential")
-			return
+			return false
 		}
 
 		currentVal := req.Header.Get(tokenHeader)
@@ -301,7 +337,7 @@ func (p *Proxy) processRequest(ctx context.Context, clientConn net.Conn, req *ht
 		if err != nil {
 			log.Printf("client cert fetch error: %v", err)
 			writeError(clientConn, 500, "failed to fetch client certificate")
-			return
+			return false
 		}
 
 		// Inject cert PEM into header if configured
@@ -314,7 +350,7 @@ func (p *Proxy) processRequest(ctx context.Context, clientConn net.Conn, req *ht
 		if err != nil {
 			log.Printf("client cert parse error: %v", err)
 			writeError(clientConn, 500, "invalid client certificate")
-			return
+			return false
 		}
 		clientTLSCert = &tlsCert
 	}
@@ -336,34 +372,35 @@ func (p *Proxy) processRequest(ctx context.Context, clientConn net.Conn, req *ht
 		log.Printf("upstream error: %v", err)
 		span.SetStatus(codes.Error, "upstream_error")
 		writeError(clientConn, 502, fmt.Sprintf("upstream error: %v", err))
-		return
+		return false
 	}
 	defer func() { _ = upstreamResp.Body.Close() }()
 
 	span.SetAttributes(attribute.Int("http.status_code", upstreamResp.StatusCode))
 
-	// Inspect response and run Lua rules if the token has any
-	if len(token.ResponseRules) > 0 {
-		p.inspectAndForwardResponse(clientConn, upstreamResp, token, tokenValue)
-	} else {
-		if err := upstreamResp.Write(clientConn); err != nil {
-			log.Printf("write response: %v", err)
-		}
-	}
+	// Forward it, inspecting on the way past if the token has rules. Whether the
+	// connection can carry another request depends on both ends: the client not
+	// having asked to close, and the response having been framed in a way the
+	// client can tell the end of.
+	reusable := p.inspectAndForwardResponse(clientConn, upstreamResp, token, tokenValue)
+	return reusable && !req.Close && req.ProtoAtLeast(1, 1)
 }
 
 func (p *Proxy) forwardRequest(req *http.Request, host string, clientCert *tls.Certificate) (*http.Response, error) {
-	tlsConfig := &tls.Config{
-		ServerName: host,
-	}
+	transport := p.upstream
 	if clientCert != nil {
-		tlsConfig.Certificates = []tls.Certificate{*clientCert}
-	}
-
-	transport := &http.Transport{
-		TLSClientConfig:       tlsConfig,
-		TLSHandshakeTimeout:   10 * time.Second,
-		ResponseHeaderTimeout: 30 * time.Second,
+		// A client certificate makes this connection specific to one token, so it
+		// cannot share the pool. Its idle connections are closed when the request
+		// is done rather than left to a transport nothing will use again.
+		transport = &http.Transport{
+			TLSClientConfig: &tls.Config{
+				ServerName:   host,
+				Certificates: []tls.Certificate{*clientCert},
+			},
+			TLSHandshakeTimeout:   10 * time.Second,
+			ResponseHeaderTimeout: 30 * time.Second,
+		}
+		defer transport.CloseIdleConnections()
 	}
 
 	req.RequestURI = ""
@@ -395,7 +432,11 @@ const maxResponseBuffer = 10 * 1024 * 1024 // 10 MiB
 // inspectAndForwardResponse tees the upstream response to the client while
 // capturing the body for Lua rule evaluation. It handles both standard JSON
 // responses and SSE streaming responses.
-func (p *Proxy) inspectAndForwardResponse(clientConn net.Conn, resp *http.Response, token *tokenstore.Token, tokenValue string) {
+//
+// It answers whether the connection can be reused afterwards, which needs the
+// client to be able to tell where the response ended: a declared length or
+// chunked framing, and not a body that runs until the connection closes.
+func (p *Proxy) inspectAndForwardResponse(clientConn net.Conn, resp *http.Response, token *tokenstore.Token, tokenValue string) bool {
 	ct := resp.Header.Get("Content-Type")
 
 	if strings.Contains(ct, "text/event-stream") {
@@ -408,7 +449,9 @@ func (p *Proxy) inspectAndForwardResponse(clientConn net.Conn, resp *http.Respon
 		if capture.lastData != "" {
 			p.evalResponseRules(token, tokenValue, []byte(capture.lastData), resp)
 		}
-		return
+		// A stream ends when the upstream closes it, so there is no next request
+		// on this connection.
+		return false
 	}
 
 	// Nothing to inspect: hand the response straight through. A token with no
@@ -416,18 +459,22 @@ func (p *Proxy) inspectAndForwardResponse(clientConn net.Conn, resp *http.Respon
 	// held in memory first -- and a proxy that buffers what it will not look at
 	// is just a slower proxy with a size limit in it.
 	if len(token.ResponseRules) == 0 || !strings.Contains(ct, "application/json") {
+		makeFramingDeterminate(resp)
 		if err := resp.Write(clientConn); err != nil {
 			log.Printf("write response: %v", err)
+			return false
 		}
-		return
+		return framedDeterminately(resp)
 	}
 
 	// One byte past the cap, so that reaching the cap is distinguishable from a
 	// body that happens to end exactly on it.
 	prefix, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBuffer+1))
 	if err != nil {
+		// Nothing was written to the client, and the upstream body is in an
+		// unknown state, so this connection is finished.
 		log.Printf("read response body: %v", err)
-		return
+		return false
 	}
 
 	if len(prefix) > maxResponseBuffer {
@@ -442,6 +489,7 @@ func (p *Proxy) inspectAndForwardResponse(clientConn net.Conn, resp *http.Respon
 		// fragment. The audit trail records that they did not run, so an
 		// accounting gap is visible rather than assumed not to exist.
 		resp.Body = io.NopCloser(io.MultiReader(bytes.NewReader(prefix), resp.Body))
+		makeFramingDeterminate(resp)
 		if err := resp.Write(clientConn); err != nil {
 			log.Printf("write response: %v", err)
 		}
@@ -454,7 +502,7 @@ func (p *Proxy) inspectAndForwardResponse(clientConn net.Conn, resp *http.Respon
 			RuleReason: fmt.Sprintf("response larger than the %d byte inspection limit; forwarded without evaluating %d rule(s)",
 				maxResponseBuffer, len(token.ResponseRules)),
 		})
-		return
+		return framedDeterminately(resp)
 	}
 
 	resp.Body = io.NopCloser(bytes.NewReader(prefix))
@@ -466,6 +514,43 @@ func (p *Proxy) inspectAndForwardResponse(clientConn net.Conn, resp *http.Respon
 	if len(prefix) > 0 {
 		p.evalResponseRules(token, tokenValue, prefix, resp)
 	}
+	// Buffered, so the length written was exact.
+	return true
+}
+
+// makeFramingDeterminate arranges for the client to be able to tell where the
+// response ends.
+//
+// A response with neither a declared length nor chunked framing -- an HTTP/2
+// response, or an HTTP/1.0 one -- can only be delimited by closing the
+// connection, which throws away the connection for every request after it.
+// Chunking it instead keeps the body streaming and the connection reusable.
+func makeFramingDeterminate(resp *http.Response) {
+	if resp.Close || resp.ContentLength >= 0 || len(resp.TransferEncoding) > 0 {
+		return
+	}
+	if resp.StatusCode == http.StatusNoContent || resp.StatusCode == http.StatusNotModified {
+		return
+	}
+	resp.TransferEncoding = []string{"chunked"}
+	if resp.ProtoMajor != 1 || resp.ProtoMinor != 1 {
+		// Written to the client as HTTP/1.1, whatever the upstream spoke.
+		resp.Proto, resp.ProtoMajor, resp.ProtoMinor = "HTTP/1.1", 1, 1
+	}
+}
+
+// framedDeterminately answers whether a client can tell where this response
+// ended without waiting for the connection to close.
+func framedDeterminately(resp *http.Response) bool {
+	if resp.Close {
+		return false
+	}
+	for _, encoding := range resp.TransferEncoding {
+		if encoding == "chunked" {
+			return true
+		}
+	}
+	return resp.ContentLength >= 0
 }
 
 func (p *Proxy) evalResponseRules(token *tokenstore.Token, tokenValue string, body []byte, resp *http.Response) {
