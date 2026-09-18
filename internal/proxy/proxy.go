@@ -542,6 +542,22 @@ func (p *Proxy) processRequest(ctx context.Context, clientConn net.Conn, req *ht
 
 	span.SetAttributes(attribute.Int("http.status_code", upstreamResp.StatusCode))
 
+	// An upgrade leaves HTTP behind, so this is the last point at which anything
+	// here can act: the credential has already been swapped into the handshake,
+	// which is the request that carried it.
+	if protocol := requestedUpgrade(req); protocol != "" && switchedProtocols(upstreamResp) {
+		p.noteUpgrade(audit.Entry{
+			TokenID:     token.ID,
+			AgentID:     token.AgentID,
+			TaskID:      token.TaskID,
+			Destination: targetHost,
+			Method:      req.Method,
+			Path:        req.URL.Path,
+			Policy:      token.PolicyName,
+		}, protocol, len(token.ResponseRules) > 0)
+		return p.spliceUpgrade(clientConn, upstreamResp, protocol)
+	}
+
 	// Forward it, inspecting on the way past if the token has rules. Whether the
 	// connection can carry another request depends on both ends: the client not
 	// having asked to close, and the response having been framed in a way the
@@ -585,6 +601,15 @@ func (p *Proxy) forwardWithoutCredential(clientConn net.Conn, req *http.Request,
 	}
 	defer func() { _ = resp.Body.Close() }()
 	describeResponse("passthrough", req, resp)
+
+	if protocol := requestedUpgrade(req); protocol != "" && switchedProtocols(resp) {
+		p.noteUpgrade(audit.Entry{
+			Destination: targetHost,
+			Method:      req.Method,
+			Path:        req.URL.Path,
+		}, protocol, false)
+		return p.spliceUpgrade(clientConn, resp, protocol)
+	}
 
 	if err := resp.Write(clientConn); err != nil {
 		log.Printf("write response: %v", err)
