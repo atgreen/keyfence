@@ -334,6 +334,10 @@ Tokens can be issued with a named policy that restricts what the token is allowe
 | `open` | No restrictions beyond token validation and destination check. |
 | `standard` | Common HTTP methods, 1000 req/hour rate limit. |
 | `strict` | GET/POST only, JSON content type, 10 MiB body limit, 1000 req/hour. |
+
+A body limit applies whether or not a request declares its size. A chunked
+request — which declares none — is read up to the limit; past it the request is
+denied, and within it the body is forwarded intact with a known length.
 | `readonly` | GET/HEAD only. Blocks all write operations. |
 
 ```bash

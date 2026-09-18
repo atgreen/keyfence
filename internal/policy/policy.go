@@ -9,7 +9,9 @@
 package policy
 
 import (
+	"bytes"
 	"fmt"
+	"io"
 	"net/http"
 	"path"
 	"strings"
@@ -207,6 +209,19 @@ func (p *Policy) checkContentType(req *http.Request) *Deny {
 	}
 }
 
+// checkBodySize enforces MaxBodyBytes whether or not the request says how big it
+// is.
+//
+// A declared Content-Length is checked and the body left alone. A chunked
+// request declares -1, so the limit used to pass it straight through: the
+// advertised maximum was enforced against requests that announced themselves and
+// not against the ones that did not, which is the wrong way round.
+//
+// For those, the body is read up to the limit plus one byte. Past the limit, the
+// request is denied. Within it, the body is replaced by what was read, so the
+// upstream sees a request of known length and nothing is lost. The buffer is
+// bounded by the limit the policy chose, which is the same amount the policy
+// already said it was willing to forward.
 func (p *Policy) checkBodySize(req *http.Request) *Deny {
 	if p.MaxBodyBytes <= 0 {
 		return nil
@@ -217,6 +232,27 @@ func (p *Policy) checkBodySize(req *http.Request) *Deny {
 			Message: fmt.Sprintf("body size %d exceeds limit %d", req.ContentLength, p.MaxBodyBytes),
 		}
 	}
+	if req.ContentLength >= 0 || req.Body == nil {
+		return nil
+	}
+
+	body, err := io.ReadAll(io.LimitReader(req.Body, p.MaxBodyBytes+1))
+	if err != nil {
+		return &Deny{
+			Rule:    "max_body_bytes",
+			Message: fmt.Sprintf("reading a request of undeclared length: %s", err),
+		}
+	}
+	if int64(len(body)) > p.MaxBodyBytes {
+		return &Deny{
+			Rule:    "max_body_bytes",
+			Message: fmt.Sprintf("body of undeclared length exceeds limit %d", p.MaxBodyBytes),
+		}
+	}
+
+	req.Body = io.NopCloser(bytes.NewReader(body))
+	req.ContentLength = int64(len(body))
+	req.TransferEncoding = nil
 	return nil
 }
 
