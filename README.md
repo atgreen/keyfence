@@ -209,6 +209,21 @@ curl -H "Authorization: Bearer $KEYFENCE_API_KEY" \
 The agent does not have this key — and under a sandbox that grants only the proxy
 port, it cannot reach the control API at all.
 
+### Hosts that need no credential
+
+KeyFence is the only way out of a sandbox, and some requests carry no credential
+at all: a connectivity probe, a changelog, an OAuth discovery document. Refusing
+those means an agent cannot start — Claude Code reports "Failed to connect to
+api.anthropic.com: Status 401" and stops.
+
+```bash
+keyfence -passthrough api.anthropic.com,platform.claude.com,raw.githubusercontent.com
+```
+
+Requests to those hosts are forwarded as they came: no token required, nothing
+injected, and recorded in the audit trail with `"label":"passthrough"` so what
+left without one is visible. Everything else still needs a token.
+
 ### Where it listens
 
 The proxy, the SSH bastion and the control API bind **loopback** by default

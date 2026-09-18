@@ -15,6 +15,8 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"os"
+	"sort"
 	"strings"
 	"time"
 
@@ -51,6 +53,18 @@ type Proxy struct {
 	policy *policy.Engine
 	named  *credstore.NamedStore
 
+	// Whether a tunnel may carry more than one request. Off by default: see
+	// reuseConnections below.
+	reuse bool
+
+	// Hosts reachable without a token at all. Nothing is injected for these:
+	// KeyFence is the only way out of the sandbox, and some requests need no
+	// credential -- a connectivity probe, a changelog, an OAuth discovery
+	// document. Refusing those means an agent cannot start; letting them through
+	// unauthenticated is what the operator asked for by naming the host, and no
+	// secret is involved either way.
+	passthrough map[string]bool
+
 	// One transport for upstream connections without a client certificate,
 	// which is nearly all of them. Building a transport per request meant a
 	// fresh TCP connection and TLS handshake every time, with the pool it
@@ -61,24 +75,51 @@ type Proxy struct {
 	addr     string
 }
 
-func New(addr string, ca *CA, store *tokenstore.Store, creds credstore.Backend, certs *credstore.CertStore, pol *policy.Engine, auditLog *audit.Logger, named *credstore.NamedStore) *Proxy {
+// normaliseHost answers a host name in the one form the passthrough set is keyed
+// by, so that "API.Anthropic.com " and "api.anthropic.com" are the same host.
+func normaliseHost(host string) string {
+	return strings.ToLower(strings.TrimSpace(host))
+}
+
+// Connection reuse is on unless -no-reuse-connections says otherwise. It was
+// briefly opt-in while a client breakage was blamed on it; the cause turned out
+// to be the upstream protocol, not reuse. The flag stays as somewhere to stand if
+// a client ever disagrees.
+func New(addr string, ca *CA, store *tokenstore.Store, creds credstore.Backend, certs *credstore.CertStore, pol *policy.Engine, auditLog *audit.Logger, named *credstore.NamedStore, passthrough []string, reuse bool) *Proxy {
+	allowed := make(map[string]bool, len(passthrough))
+	for _, host := range passthrough {
+		if name := normaliseHost(host); name != "" {
+			allowed[name] = true
+		}
+	}
 	return &Proxy{
-		ca:     ca,
-		store:  store,
-		creds:  creds,
-		certs:  certs,
-		policy: pol,
-		named:  named,
+		ca:          ca,
+		store:       store,
+		creds:       creds,
+		certs:       certs,
+		policy:      pol,
+		named:       named,
+		passthrough: allowed,
+		reuse:       reuse,
 		upstream: &http.Transport{
 			TLSHandshakeTimeout:   10 * time.Second,
 			ResponseHeaderTimeout: 30 * time.Second,
 			MaxIdleConnsPerHost:   8,
 			IdleConnTimeout:       90 * time.Second,
-			// HTTP/1.1 upstream deliberately. What reaches the client is
-			// re-serialized as HTTP/1.1 either way, and an HTTP/2 response
-			// arrives with neither a length nor chunked framing, so it would
-			// have to be buffered or re-chunked to be forwarded at all.
-			ForceAttemptHTTP2: false,
+			// HTTP/1.1 upstream, and this is the way to mean it.
+			//
+			// ForceAttemptHTTP2: false does not disable HTTP/2 -- Go enables it
+			// anyway when a transport has no TLSClientConfig, which a shared one
+			// does not need. An empty non-nil TLSNextProto is what actually says
+			// "no ALPN protocols beyond HTTP/1.1".
+			//
+			// It matters because what reaches the client is re-serialized as
+			// HTTP/1.1, and an HTTP/2 response carries neither a Content-Length
+			// nor chunked framing: written out as HTTP/1.1 it can only be
+			// delimited by closing the connection. curl tolerates that. Claude
+			// Code answered "Unable to connect to API
+			// (Malformed_HTTP_Response)", and was right to.
+			TLSNextProto: map[string]func(string, *tls.Conn) http.RoundTripper{},
 		},
 		audit: auditLog,
 		lua:   luaengine.New(),
@@ -216,6 +257,18 @@ func (p *Proxy) processRequest(ctx context.Context, clientConn net.Conn, req *ht
 
 	// Find kf_ token in any header
 	tokenValue, tokenHeader := findToken(req)
+	if tokenValue == "" && p.passthrough[normaliseHost(targetHost)] {
+		// Named as needing no credential. Forwarded as it came, with nothing
+		// added, and recorded so that what went out without a token is visible.
+		p.audit.Log(audit.Entry{
+			Event:       audit.EventAllow,
+			Destination: targetHost,
+			Method:      req.Method,
+			Path:        req.URL.Path,
+			Label:       "passthrough",
+		})
+		return p.forwardWithoutCredential(clientConn, req, targetHost)
+	}
 	if tokenValue == "" {
 		p.audit.Log(audit.Entry{
 			Event:       audit.EventDeny,
@@ -223,7 +276,7 @@ func (p *Proxy) processRequest(ctx context.Context, clientConn net.Conn, req *ht
 			Method:      req.Method,
 			Path:        req.URL.Path,
 			DenyRule:    "no_token",
-			DenyReason:  "no keyfence token found in request headers",
+			DenyReason:  fmt.Sprintf("no keyfence token found in request headers, and %s is not a passthrough host", targetHost),
 		})
 		span.SetStatus(codes.Error, "no_token")
 		writeError(clientConn, 401, "no keyfence token found in request headers")
@@ -410,6 +463,25 @@ func (p *Proxy) forwardRequest(req *http.Request, host string, clientCert *tls.C
 	return transport.RoundTrip(req)
 }
 
+// forwardWithoutCredential sends a request on as it arrived, for a host the
+// operator said needs no credential. No token is looked up, nothing is swapped
+// in, and no policy applies, because there is no token to carry one.
+func (p *Proxy) forwardWithoutCredential(clientConn net.Conn, req *http.Request, targetHost string) bool {
+	resp, err := p.forwardRequest(req, targetHost, nil)
+	if err != nil {
+		writeError(clientConn, 502, fmt.Sprintf("upstream error: %v", err))
+		return false
+	}
+	defer func() { _ = resp.Body.Close() }()
+	describeResponse("passthrough", req, resp)
+
+	if err := resp.Write(clientConn); err != nil {
+		log.Printf("write response: %v", err)
+		return false
+	}
+	return framedDeterminately(resp) && !req.Close && req.ProtoAtLeast(1, 1)
+}
+
 // resolveCredential answers the real credential behind a token.
 //
 // A named reference is resolved on every request, which is what makes rotation
@@ -439,6 +511,7 @@ const maxResponseBuffer = 10 * 1024 * 1024 // 10 MiB
 func (p *Proxy) inspectAndForwardResponse(clientConn net.Conn, resp *http.Response, token *tokenstore.Token, tokenValue string) bool {
 	ct := resp.Header.Get("Content-Type")
 
+	describeResponse("inspect", resp.Request, resp)
 	if strings.Contains(ct, "text/event-stream") {
 		// SSE: wrap body to capture the last data: line while streaming to client
 		capture := &sseCapture{src: resp.Body}
@@ -459,7 +532,6 @@ func (p *Proxy) inspectAndForwardResponse(clientConn net.Conn, resp *http.Respon
 	// held in memory first -- and a proxy that buffers what it will not look at
 	// is just a slower proxy with a size limit in it.
 	if len(token.ResponseRules) == 0 || !strings.Contains(ct, "application/json") {
-		makeFramingDeterminate(resp)
 		if err := resp.Write(clientConn); err != nil {
 			log.Printf("write response: %v", err)
 			return false
@@ -489,7 +561,6 @@ func (p *Proxy) inspectAndForwardResponse(clientConn net.Conn, resp *http.Respon
 		// fragment. The audit trail records that they did not run, so an
 		// accounting gap is visible rather than assumed not to exist.
 		resp.Body = io.NopCloser(io.MultiReader(bytes.NewReader(prefix), resp.Body))
-		makeFramingDeterminate(resp)
 		if err := resp.Write(clientConn); err != nil {
 			log.Printf("write response: %v", err)
 		}
@@ -518,25 +589,64 @@ func (p *Proxy) inspectAndForwardResponse(clientConn net.Conn, resp *http.Respon
 	return true
 }
 
-// makeFramingDeterminate arranges for the client to be able to tell where the
-// response ends.
+// A response with neither a declared length nor chunked framing can only be
+// delimited by closing the connection, so that is what happens: it is written as
+// it came and the connection ends with it.
 //
-// A response with neither a declared length nor chunked framing -- an HTTP/2
-// response, or an HTTP/1.0 one -- can only be delimited by closing the
-// connection, which throws away the connection for every request after it.
-// Chunking it instead keeps the body streaming and the connection reusable.
-func makeFramingDeterminate(resp *http.Response) {
-	if resp.Close || resp.ContentLength >= 0 || len(resp.TransferEncoding) > 0 {
+// Re-chunking such a response to keep the connection alive seemed obvious and was
+// wrong. Claude Code answered "Unable to connect to API
+// (Malformed_HTTP_Response)": rewriting framing on a response whose headers still
+// described the original produced something no client could parse. Forwarding
+// faithfully and losing the reuse is the correct trade -- the framing a response
+// arrived with is not KeyFence's to reinterpret.
+
+// debugResponses turns on a line per response describing exactly how it was
+// framed, which is the only way to tell why a client called one malformed.
+// Enabled with KEYFENCE_DEBUG_RESPONSES=1.
+var debugResponses = os.Getenv("KEYFENCE_DEBUG_RESPONSES") == "1"
+
+func describeResponse(where string, req *http.Request, resp *http.Response) {
+	if !debugResponses {
 		return
 	}
-	if resp.StatusCode == http.StatusNoContent || resp.StatusCode == http.StatusNotModified {
-		return
+	log.Printf("response[%s] %s %s -> %s proto=%s len=%d te=%v close=%v uncompressed=%v headers=%v",
+		where, req.Method, req.URL.Path, resp.Status, resp.Proto,
+		resp.ContentLength, resp.TransferEncoding, resp.Close, resp.Uncompressed,
+		headerNames(resp.Header))
+}
+
+func headerNames(header http.Header) []string {
+	names := make([]string, 0, len(header))
+	for name := range header {
+		names = append(names, name)
 	}
-	resp.TransferEncoding = []string{"chunked"}
-	if resp.ProtoMajor != 1 || resp.ProtoMinor != 1 {
-		// Written to the client as HTTP/1.1, whatever the upstream spoke.
-		resp.Proto, resp.ProtoMajor, resp.ProtoMinor = "HTTP/1.1", 1, 1
+	sort.Strings(names)
+	return names
+}
+
+// maxDrainOnReuse bounds how much of an unread request body will be swallowed to
+// keep a connection usable. Beyond it, closing is cheaper than reading.
+const maxDrainOnReuse = 256 * 1024
+
+// requestBodyDrained consumes whatever is left of a request body, answering
+// whether the connection is safe to read another request from.
+//
+// This is the bug that made an agent report "Unable to connect to API
+// (Malformed_HTTP_Response)". An upstream that answers before reading the whole
+// request -- an error, a redirect -- leaves the rest of the body unread in the
+// tunnel, and the next ReadRequest then parses those bytes as a request. What
+// came back was a refusal aimed at a request nobody sent, arriving where the
+// client expected a response.
+//
+// Go's own HTTP server does exactly this before reusing a connection, for exactly
+// this reason.
+func requestBodyDrained(req *http.Request) bool {
+	if req.Body == nil {
+		return true
 	}
+	remaining, err := io.Copy(io.Discard, io.LimitReader(req.Body, maxDrainOnReuse+1))
+	_ = req.Body.Close()
+	return err == nil && remaining <= maxDrainOnReuse
 }
 
 // framedDeterminately answers whether a client can tell where this response

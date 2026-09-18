@@ -75,6 +75,8 @@ func main() {
 	apiKey := flag.String("api-key", "", "require this Bearer token on all control API requests")
 	apiKeyFile := flag.String("api-key-file", "", "read the control API key from this file, so it is not in argv")
 	insecureAPI := flag.Bool("insecure-api", false, "run the control API with no key at all (it can issue and revoke credentials)")
+	noReuse := flag.Bool("no-reuse-connections", false, "close each tunnel after one request instead of keeping it for the next")
+	passthrough := flag.String("passthrough", "", "comma-separated hosts reachable through the proxy without a token (nothing is injected for them)")
 	credentialsDir := flag.String("credentials-dir", "", "directory of credentials registered by name, resolved per request (systemd's $CREDENTIALS_DIRECTORY is always searched)")
 	knownHosts := flag.String("ssh-known-hosts", "", "known_hosts file used to authenticate upstream SSH hosts (default <data-dir>/ssh/known_hosts)")
 	insecureHostKeys := flag.Bool("ssh-insecure-host-keys", false, "accept any upstream SSH host key (the bastion's key can then be used against an impostor)")
@@ -179,7 +181,12 @@ func main() {
 	})
 
 	// Start HTTPS proxy
-	p := proxy.New(*proxyAddr, ca, store, creds, certs, pol, auditLog, named)
+	passthroughHosts := strings.Split(*passthrough, ",")
+	if *passthrough != "" {
+		log.Printf("passthrough (no token required): %s", *passthrough)
+	}
+	p := proxy.New(*proxyAddr, ca, store, creds, certs, pol, auditLog, named, passthroughHosts,
+		!*noReuse)
 	go func() {
 		if proxyListener != nil {
 			if err := p.Serve(proxyListener); err != nil {
