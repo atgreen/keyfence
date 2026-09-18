@@ -10,6 +10,7 @@ package tokenstore
 
 import (
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
 	"path"
@@ -154,6 +155,12 @@ type IssueParams struct {
 	ResponseRules       []ResponseRule
 }
 
+// tokenID answers the stable, public identifier for a token value.
+func tokenID(value string) string {
+	sum := sha256.Sum256([]byte(value))
+	return hex.EncodeToString(sum[:8])
+}
+
 func (s *Store) Issue(p IssueParams) (*Token, error) {
 	random := make([]byte, 16)
 	if _, err := rand.Read(random); err != nil {
@@ -164,7 +171,13 @@ func (s *Store) Issue(p IssueParams) (*Token, error) {
 	now := time.Now()
 
 	token := &Token{
-		ID:                  hex.EncodeToString(random[:8]),
+		// Derived from the value by hashing rather than taken from it. The id was
+		// the first eight of the sixteen random bytes, so every audit entry
+		// naming a token handed out half of it -- and the audit trail is the one
+		// thing here designed to be copied elsewhere, into a webhook, an SSE
+		// subscriber or a log aggregator. A hash identifies the token to anyone
+		// holding it and tells anyone else nothing.
+		ID:                  tokenID(value),
 		Value:               value,
 		CredentialID:        p.CredentialID,
 		CredentialRef:       p.CredentialRef,

@@ -147,6 +147,10 @@ func main() {
 	auditLog := audit.New(os.Stdout)
 	sseSink := audit.NewSSESink()
 	auditLog.AddSink(sseSink)
+	// A short, queryable history, so that a client can ask what happened during
+	// its run instead of holding a subscription open or reading the journal.
+	recent := audit.NewRecent(0)
+	auditLog.AddSink(recent)
 
 	store := tokenstore.New()
 	creds := credstore.NewEnvBackend()
@@ -252,6 +256,14 @@ func main() {
 	// What is registered, by name. Never a value: an operator asking "can the
 	// broker use the github credential" should not have to cause an error to find
 	// out, which was the only way before this existed.
+	// What happened, optionally for one task. Entries name tokens by id and carry
+	// no secret, which is what makes this safe to hand to whoever asked.
+	mux.HandleFunc("GET /audit", requireAPIKey(controlKey, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"entries": recent.Entries(r.URL.Query().Get("task_id")),
+		})
+	}))
 	mux.HandleFunc("GET /credentials", requireAPIKey(controlKey, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{
@@ -619,10 +631,18 @@ func handleRevokeToken(store *tokenstore.Store, auditLog *audit.Logger, reaper *
 			// At once, not at the next sweep: a revoked credential that lingers
 			// is a credential still usable by whoever copied it.
 			reaper.forget(revoked)
-			auditLog.Log(audit.Entry{
-				Event:   audit.EventRevoke,
-				TokenID: tokenValue,
-			})
+			// The token's id, never its value. Logging the value put a live
+			// credential in the audit trail -- and the trail is the one thing
+			// here designed to be copied elsewhere, into a webhook, an SSE
+			// subscriber or a log aggregator.
+			entry := audit.Entry{Event: audit.EventRevoke}
+			if revoked != nil {
+				entry.TokenID = revoked.ID
+				entry.AgentID = revoked.AgentID
+				entry.TaskID = revoked.TaskID
+				entry.Label = revoked.Label
+			}
+			auditLog.Log(entry)
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(map[string]string{"status": "revoked"})
 		} else {

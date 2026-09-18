@@ -342,6 +342,27 @@ not a path: anything with a separator in it is refused, and an unregistered name
 is refused at issuance with the list of names that do exist, rather than becoming
 a 500 the agent sees later.
 
+### Asking what happened
+
+`GET /audit` answers with the entries KeyFence holds in memory, most recent last,
+and `?task_id=X` narrows it to one task:
+
+```bash
+curl -H "Authorization: Bearer $KEYFENCE_API_KEY" \
+  "http://localhost:10212/audit?task_id=scute-1234-ab12cd"
+```
+
+That is how a client asks "what happened during my run" without holding a
+subscription open or reading the service's journal — which is what Scute does when
+a sandboxed command fails, so that a refusal by the broker is reported beside the
+command's own failure rather than living in a log nobody thought to read.
+
+Entries name tokens by an id derived from hashing the token, so an audit trail
+identifies a credential without containing any part of one.
+
+The buffer is bounded (2048 entries) and is a window on the recent past, not
+storage. For everything, subscribe to `GET /events` or read the log.
+
 ### What happens to a credential when its token goes
 
 A credential handed over at issuance is held so it can be swapped in on each
