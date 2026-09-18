@@ -75,6 +75,7 @@ func main() {
 	apiKey := flag.String("api-key", "", "require this Bearer token on all control API requests")
 	apiKeyFile := flag.String("api-key-file", "", "read the control API key from this file, so it is not in argv")
 	insecureAPI := flag.Bool("insecure-api", false, "run the control API with no key at all (it can issue and revoke credentials)")
+	credentialsDir := flag.String("credentials-dir", "", "directory of credentials registered by name, resolved per request (systemd's $CREDENTIALS_DIRECTORY is always searched)")
 	knownHosts := flag.String("ssh-known-hosts", "", "known_hosts file used to authenticate upstream SSH hosts (default <data-dir>/ssh/known_hosts)")
 	insecureHostKeys := flag.Bool("ssh-insecure-host-keys", false, "accept any upstream SSH host key (the bastion's key can then be used against an impostor)")
 	flag.Parse()
@@ -140,9 +141,18 @@ func main() {
 
 	store := tokenstore.New()
 	creds := credstore.NewEnvBackend()
+	// Credentials the operator registered by name, which a client can ask for
+	// without ever holding: it says "anthropic", and the bytes stay here.
+	named := credstore.NewNamedStore(*credentialsDir)
+	if directories := named.Directories(); len(directories) > 0 {
+		log.Printf("named credentials from %v; %d registered", directories, len(named.Names()))
+	}
 	certs := credstore.NewCertStore()
 	sshKeys := credstore.NewSSHKeyStore()
 	pol := policy.NewEngine()
+
+	reaper := &credentialReaper{store: store, creds: creds, certs: certs, sshKeys: sshKeys}
+	go reaper.run(ctx, time.Minute)
 
 	// Register built-in policies
 	pol.Register(&policy.Policy{
@@ -169,7 +179,7 @@ func main() {
 	})
 
 	// Start HTTPS proxy
-	p := proxy.New(*proxyAddr, ca, store, creds, certs, pol, auditLog)
+	p := proxy.New(*proxyAddr, ca, store, creds, certs, pol, auditLog, named)
 	go func() {
 		if proxyListener != nil {
 			if err := p.Serve(proxyListener); err != nil {
@@ -211,9 +221,9 @@ func main() {
 
 	// Token management API
 	mux := http.NewServeMux()
-	mux.HandleFunc("POST /tokens", requireAPIKey(controlKey, handleIssueToken(store, creds, certs, sshKeys, auditLog)))
+	mux.HandleFunc("POST /tokens", requireAPIKey(controlKey, handleIssueToken(store, creds, certs, sshKeys, auditLog, named)))
 	mux.HandleFunc("GET /tokens", requireAPIKey(controlKey, handleListTokens(store)))
-	mux.HandleFunc("DELETE /tokens/{token}", requireAPIKey(controlKey, handleRevokeToken(store, auditLog)))
+	mux.HandleFunc("DELETE /tokens/{token}", requireAPIKey(controlKey, handleRevokeToken(store, auditLog, reaper)))
 	mux.HandleFunc("DELETE /tasks/{task_id}/tokens", requireAPIKey(controlKey, handleRevokeByTask(store, auditLog)))
 	mux.HandleFunc("GET /policies", requireAPIKey(controlKey, handleListPolicies(pol)))
 	mux.HandleFunc("PUT /credentials/{id}", requireAPIKey(controlKey, handleRotateCredential(creds, store, auditLog)))
@@ -313,6 +323,7 @@ func exportCACert(ca *proxy.CA, dir string) error {
 
 type issueRequest struct {
 	Credential        string                    `json:"credential"`
+	CredentialRef     string                    `json:"credential_ref"`
 	Destinations      []string                  `json:"destinations"`
 	TTLSeconds        int                       `json:"ttl_seconds"`
 	Label             string                    `json:"label"`
@@ -339,15 +350,31 @@ type issueResponse struct {
 	TaskID       string   `json:"task_id,omitempty"`
 }
 
-func handleIssueToken(store *tokenstore.Store, creds credstore.Backend, certStore *credstore.CertStore, sshKeyStore *credstore.SSHKeyStore, auditLog *audit.Logger) http.HandlerFunc {
+func handleIssueToken(store *tokenstore.Store, creds credstore.Backend, certStore *credstore.CertStore, sshKeyStore *credstore.SSHKeyStore, auditLog *audit.Logger, named *credstore.NamedStore) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var req issueRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			http.Error(w, fmt.Sprintf(`{"error":"invalid json: %s"}`, err), 400)
 			return
 		}
-		if req.Credential == "" && req.ClientCert == "" && req.SSHPrivateKey == "" {
-			http.Error(w, `{"error":"credential, client_cert, or ssh_private_key is required"}`, 400)
+		if req.Credential == "" && req.CredentialRef == "" && req.ClientCert == "" && req.SSHPrivateKey == "" {
+			http.Error(w, `{"error":"credential, credential_ref, client_cert, or ssh_private_key is required"}`, 400)
+			return
+		}
+		if req.Credential != "" && req.CredentialRef != "" {
+			http.Error(w, `{"error":"credential and credential_ref are alternatives; give one"}`, 400)
+			return
+		}
+		// Checked here rather than at request time, so that a mistyped name is a
+		// failed issuance the caller sees rather than a 500 the agent sees later.
+		if req.CredentialRef != "" && !named.Has(req.CredentialRef) {
+			body, _ := json.Marshal(map[string]any{
+				"error":     fmt.Sprintf("no credential named %q is registered", req.CredentialRef),
+				"available": named.Names(),
+			})
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(400)
+			_, _ = w.Write(body)
 			return
 		}
 		// A token is worth having because it is worth less than the credential
@@ -408,6 +435,7 @@ func handleIssueToken(store *tokenstore.Store, creds credstore.Backend, certStor
 
 		token, err := store.Issue(tokenstore.IssueParams{
 			CredentialID:        credID,
+			CredentialRef:       req.CredentialRef,
 			AllowedDestinations: req.Destinations,
 			TTL:                 ttl,
 			Label:               req.Label,
@@ -480,10 +508,73 @@ func handleListTokens(store *tokenstore.Store) http.HandlerFunc {
 	}
 }
 
-func handleRevokeToken(store *tokenstore.Store, auditLog *audit.Logger) http.HandlerFunc {
+// credentialReaper forgets credential material nothing valid refers to any more.
+//
+// A token issued with a credential in the request body causes those bytes to be
+// stored here. Revoking the token marked it unusable but left the bytes, so a
+// broker that ran for a week held every secret it had ever been handed -- exactly
+// the accumulation it exists to prevent. This is the other half of the fix: once
+// no valid token needs them, they go.
+//
+// The token record itself survives an explicit revoke, so that using a revoked
+// token still says "revoked" rather than "never heard of it". It is the periodic
+// pass that eventually forgets the record too.
+type credentialReaper struct {
+	store   *tokenstore.Store
+	creds   credstore.Backend
+	certs   *credstore.CertStore
+	sshKeys *credstore.SSHKeyStore
+}
+
+// forget drops whatever the given tokens were the last reason to keep.
+func (r *credentialReaper) forget(tokens ...*tokenstore.Token) {
+	for _, t := range tokens {
+		if t == nil {
+			continue
+		}
+		if t.CredentialID != "" && r.store.CountByCredentialID(t.CredentialID) == 0 {
+			if err := r.creds.Delete(t.CredentialID); err != nil {
+				log.Printf("forgetting credential %s: %v", t.CredentialID, err)
+			}
+		}
+		if t.ClientCertID != "" && r.store.CountByClientCertID(t.ClientCertID) == 0 {
+			_ = r.certs.Delete(t.ClientCertID)
+		}
+		if t.SSHKeyID != "" && r.store.CountBySSHKeyID(t.SSHKeyID) == 0 {
+			_ = r.sshKeys.Delete(t.SSHKeyID)
+		}
+	}
+}
+
+// sweep removes expired and revoked tokens, then forgets what they held.
+func (r *credentialReaper) sweep() {
+	r.forget(r.store.Cleanup()...)
+}
+
+// run sweeps on a timer for as long as KeyFence is running. Without this, an
+// expired token is never noticed by anything -- Cleanup existed and nobody
+// called it -- so both the record and its credential stayed until restart.
+func (r *credentialReaper) run(ctx context.Context, every time.Duration) {
+	ticker := time.NewTicker(every)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			r.sweep()
+		}
+	}
+}
+
+func handleRevokeToken(store *tokenstore.Store, auditLog *audit.Logger, reaper *credentialReaper) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		tokenValue := r.PathValue("token")
+		revoked := store.Lookup(tokenValue)
 		if store.Revoke(tokenValue) {
+			// At once, not at the next sweep: a revoked credential that lingers
+			// is a credential still usable by whoever copied it.
+			reaper.forget(revoked)
 			auditLog.Log(audit.Entry{
 				Event:   audit.EventRevoke,
 				TokenID: tokenValue,

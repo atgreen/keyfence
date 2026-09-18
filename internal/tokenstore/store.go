@@ -22,6 +22,7 @@ type Token struct {
 	ID                  string
 	Value               string                 // kf_<random>
 	CredentialID        string                 // reference into credential backend
+	CredentialRef       string                 // name of an operator-registered credential
 	AllowedDestinations []string               // hosts or host/path patterns this token can be used against
 	PolicyName          string                 // optional policy to evaluate on each request
 	AgentID             string                 // orchestrator-assigned agent identity
@@ -138,6 +139,7 @@ func New() *Store {
 // IssueParams holds all parameters for token issuance.
 type IssueParams struct {
 	CredentialID        string
+	CredentialRef       string
 	AllowedDestinations []string
 	TTL                 time.Duration
 	Label               string
@@ -165,6 +167,7 @@ func (s *Store) Issue(p IssueParams) (*Token, error) {
 		ID:                  hex.EncodeToString(random[:8]),
 		Value:               value,
 		CredentialID:        p.CredentialID,
+		CredentialRef:       p.CredentialRef,
 		AllowedDestinations: p.AllowedDestinations,
 		PolicyName:          p.PolicyName,
 		AgentID:             p.AgentID,
@@ -186,6 +189,15 @@ func (s *Store) Issue(p IssueParams) (*Token, error) {
 	s.mu.Unlock()
 
 	return token, nil
+}
+
+// Lookup answers the token record whether or not it is still usable, which is
+// what a caller cleaning up after a token needs: Resolve deliberately answers
+// nothing for a token that has expired or been revoked.
+func (s *Store) Lookup(tokenValue string) *Token {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.tokens[tokenValue]
 }
 
 func (s *Store) Resolve(tokenValue string) *Token {
@@ -280,17 +292,46 @@ func (s *Store) CheckRate(tokenValue string) bool {
 	return t.rateCount <= t.RateLimit
 }
 
-// Cleanup removes expired and revoked tokens.
-func (s *Store) Cleanup() int {
+// Cleanup removes expired and revoked tokens and answers what it removed, so
+// that a caller can forget the credentials they were the last reason to keep.
+func (s *Store) Cleanup() []*Token {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	removed := 0
+	var removed []*Token
 	for k, t := range s.tokens {
 		if t.Revoked || time.Now().After(t.ExpiresAt) {
 			delete(s.tokens, k)
-			removed++
+			removed = append(removed, t)
 		}
 	}
 	return removed
+}
+
+// CountByClientCertID returns the number of valid tokens using a client cert.
+func (s *Store) CountByClientCertID(certID string) int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	count := 0
+	for _, t := range s.tokens {
+		if t.IsValid() && t.ClientCertID == certID {
+			count++
+		}
+	}
+	return count
+}
+
+// CountBySSHKeyID returns the number of valid tokens using an SSH key.
+func (s *Store) CountBySSHKeyID(keyID string) int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	count := 0
+	for _, t := range s.tokens {
+		if t.IsValid() && t.SSHKeyID == keyID {
+			count++
+		}
+	}
+	return count
 }

@@ -49,18 +49,20 @@ type Proxy struct {
 	creds  credstore.Backend
 	certs  *credstore.CertStore
 	policy *policy.Engine
+	named  *credstore.NamedStore
 	audit  *audit.Logger
 	lua    *luaengine.Engine
 	addr   string
 }
 
-func New(addr string, ca *CA, store *tokenstore.Store, creds credstore.Backend, certs *credstore.CertStore, pol *policy.Engine, auditLog *audit.Logger) *Proxy {
+func New(addr string, ca *CA, store *tokenstore.Store, creds credstore.Backend, certs *credstore.CertStore, pol *policy.Engine, auditLog *audit.Logger, named *credstore.NamedStore) *Proxy {
 	return &Proxy{
 		ca:     ca,
 		store:  store,
 		creds:  creds,
 		certs:  certs,
 		policy: pol,
+		named:  named,
 		audit:  auditLog,
 		lua:    luaengine.New(),
 		addr:   addr,
@@ -273,8 +275,8 @@ func (p *Proxy) processRequest(ctx context.Context, clientConn net.Conn, req *ht
 	}
 
 	// Fetch and swap header credential (if token has one)
-	if token.CredentialID != "" {
-		realCredential, err := p.creds.Fetch(token.CredentialID)
+	if token.CredentialID != "" || token.CredentialRef != "" {
+		realCredential, err := p.resolveCredential(token)
 		if err != nil {
 			log.Printf("credential fetch error: %v", err)
 			writeError(clientConn, 500, "failed to fetch credential")
@@ -369,6 +371,23 @@ func (p *Proxy) forwardRequest(req *http.Request, host string, clientCert *tls.C
 	req.Header.Del("Proxy-Authorization")
 
 	return transport.RoundTrip(req)
+}
+
+// resolveCredential answers the real credential behind a token.
+//
+// A named reference is resolved on every request, which is what makes rotation
+// work without reissuing anything: replace the file, and the next request carries
+// the new value. A credential handed over at issuance is fetched from the backend
+// it was stored in, as before.
+func (p *Proxy) resolveCredential(token *tokenstore.Token) (string, error) {
+	if token.CredentialRef != "" {
+		if p.named == nil {
+			return "", fmt.Errorf("token references credential %q but no credential directories are configured",
+				token.CredentialRef)
+		}
+		return p.named.Resolve(token.CredentialRef)
+	}
+	return p.creds.Fetch(token.CredentialID)
 }
 
 const maxResponseBuffer = 10 * 1024 * 1024 // 10 MiB

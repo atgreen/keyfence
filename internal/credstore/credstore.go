@@ -26,6 +26,12 @@ type Backend interface {
 	// Update replaces the value of an existing credential. All tokens
 	// referencing this ID will use the new value on their next request.
 	Update(id, newValue string) error
+
+	// Delete forgets a credential. Called when the last token referencing it is
+	// revoked or expires: the bytes were only ever held to serve that token, and
+	// a broker that runs for weeks should not accumulate every secret it was
+	// ever handed. Deleting something already gone is not an error.
+	Delete(id string) error
 }
 
 // EnvBackend stores credentials in-memory, keyed by auto-generated IDs.
@@ -64,6 +70,14 @@ func (e *EnvBackend) Fetch(id string) (string, error) {
 		return "", fmt.Errorf("credential %q not found", id)
 	}
 	return val, nil
+}
+
+func (e *EnvBackend) Delete(id string) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	delete(e.creds, id)
+	return nil
 }
 
 func (e *EnvBackend) Update(id, newValue string) error {
@@ -117,6 +131,15 @@ func (c *CertStore) Fetch(id string) (*ClientCert, error) {
 	return cert, nil
 }
 
+// Delete forgets a client certificate and its private key.
+func (c *CertStore) Delete(id string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	delete(c.certs, id)
+	return nil
+}
+
 func (c *CertStore) Update(id, certPEM, keyPEM string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -168,6 +191,15 @@ func (s *SSHKeyStore) Fetch(id string) (*SSHKey, error) {
 	return key, nil
 }
 
+// Delete forgets an SSH private key.
+func (s *SSHKeyStore) Delete(id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	delete(s.keys, id)
+	return nil
+}
+
 func (s *SSHKeyStore) Update(id, privateKeyPEM, username string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -193,6 +225,12 @@ func (e *EnvMappedBackend) Store(value string) (string, error) {
 
 func (e *EnvMappedBackend) Update(id, newValue string) error {
 	return fmt.Errorf("env-mapped backend does not support credential rotation")
+}
+
+// Delete is a no-op: this backend holds nothing of its own, it reads the
+// environment KeyFence was started with.
+func (e *EnvMappedBackend) Delete(id string) error {
+	return nil
 }
 
 func (e *EnvMappedBackend) Fetch(id string) (string, error) {

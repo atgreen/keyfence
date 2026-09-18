@@ -35,7 +35,15 @@ Sockets=keyfence.socket keyfence-api.socket keyfence-ssh.socket
 # can read it, and passed by filename rather than on a command line where every
 # process of this user could read it out of /proc.
 ExecStartPre=/bin/sh -c 'mkdir -p %h/.keyfence && test -s %h/.keyfence/api-key || { umask 077; head -c 16 /dev/urandom | od -An -tx1 | tr -d " \\n" > %h/.keyfence/api-key; }'
-ExecStart=/usr/bin/keyfence -data-dir %h/.keyfence -api-key-file %h/.keyfence/api-key
+ExecStart=/usr/bin/keyfence -data-dir %h/.keyfence -api-key-file %h/.keyfence/api-key \
+    -credentials-dir %h/.keyfence/credentials
+
+# Credentials registered by name live in %h/.keyfence/credentials, one file each,
+# and are resolved per request -- so rotating one is replacing a file. Tokens can
+# then be minted by reference, which means whoever mints them never holds the
+# secret. systemd's own credential store works too: add
+#   LoadCredential=anthropic:/path/to/secret
+# and KeyFence finds it in $CREDENTIALS_DIRECTORY without being told.
 
 Restart=on-failure
 RestartSec=2

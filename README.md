@@ -254,6 +254,49 @@ Response:
 }
 ```
 
+### Credentials KeyFence holds by name
+
+A token can be issued against a credential the operator registered, instead of
+one the caller hands over:
+
+```bash
+# Register it once — a file whose name is the credential's name
+install -m600 /dev/null ~/.keyfence/credentials/anthropic
+printf '%s' "$ANTHROPIC_API_KEY" > ~/.keyfence/credentials/anthropic
+keyfence -credentials-dir ~/.keyfence/credentials ...
+
+# Then mint tokens without ever holding the secret
+curl -H "Authorization: Bearer $KEYFENCE_API_KEY" \
+  -X POST http://localhost:10212/tokens \
+  -d '{"credential_ref":"anthropic","destinations":["api.anthropic.com"],"ttl_seconds":300}'
+```
+
+This is the difference between *KeyFence holds the secret* and *KeyFence was
+handed the secret by something that held it first*. A client minting a token by
+reference never possesses the credential at all — it says `anthropic`, and the
+bytes never leave the broker.
+
+Three places are searched, in order: `$CREDENTIALS_DIRECTORY/<name>` (which is
+what systemd's `LoadCredential=` populates, readable only by the service),
+`<credentials-dir>/<name>`, and `KEYFENCE_CREDENTIAL_<NAME>` in the environment.
+
+Resolution happens per request, so **rotation is replacing a file** — the next
+request carries the new value and nothing has to be reissued. A name is a name,
+not a path: anything with a separator in it is refused, and an unregistered name
+is refused at issuance with the list of names that do exist, rather than becoming
+a 500 the agent sees later.
+
+### What happens to a credential when its token goes
+
+A credential handed over at issuance is held so it can be swapped in on each
+request. When the last valid token referencing it is revoked or expires, it is
+forgotten: immediately on an explicit revoke, and within a minute for an expired
+one. A broker that runs for a week does not accumulate every secret it was ever
+given.
+
+A credential registered by name is never copied in the first place, so there is
+nothing to forget.
+
 ### List tokens
 
 ```bash
