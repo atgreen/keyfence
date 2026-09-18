@@ -231,6 +231,16 @@ func main() {
 	mux.HandleFunc("PUT /credentials/{id}/sshkey", requireAPIKey(controlKey, handleRotateSSHKey(sshKeys, auditLog)))
 	mux.HandleFunc("POST /webhooks", requireAPIKey(controlKey, handleRegisterWebhook(auditLog)))
 	mux.HandleFunc("GET /events", requireAPIKey(controlKey, sseSink.ServeHTTP))
+	// The CA certificate, unauthenticated because it is public by definition:
+	// every agent behind this proxy has to trust it, and it is exported
+	// world-readable wherever -certs-dir points. Serving it means a client does
+	// not have to know where KeyFence keeps its data directory -- which is the
+	// sort of thing that goes wrong quietly, as a TLS failure that reads like a
+	// network fault.
+	mux.HandleFunc("GET /ca", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/x-pem-file")
+		_, _ = w.Write(ca.CertPEM())
+	})
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
