@@ -311,3 +311,21 @@ func (e *Engine) checkBudget(p *Policy, tokenID string) *Deny {
 	}
 	return nil
 }
+
+// Forget removes all mutable policy accounting for a token or delegation root.
+// The token lifecycle owner calls this only after no valid token in that lineage
+// remains, so a later ID cannot inherit stale rate or budget consumption.
+func (e *Engine) Forget(tokenID string) {
+	e.rateMu.Lock()
+	prefix := tokenID + ":"
+	for key := range e.rates {
+		if strings.HasPrefix(key, prefix) {
+			delete(e.rates, key)
+		}
+	}
+	e.rateMu.Unlock()
+
+	e.budgetMu.Lock()
+	delete(e.budgets, tokenID)
+	e.budgetMu.Unlock()
+}

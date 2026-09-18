@@ -61,6 +61,16 @@ func (t *Token) IsValid() bool {
 	return time.Now().Before(t.ExpiresAt)
 }
 
+// RootTokenID answers the public ID used to account for a whole delegation
+// lineage. Root tokens predate the explicit RootID field, so their own ID is
+// the root.
+func (t *Token) RootTokenID() string {
+	if t.RootID != "" {
+		return t.RootID
+	}
+	return t.ID
+}
+
 // AnyDestination is the destination entry that means "anywhere". A token
 // carrying it is a second copy of the credential it stands for, usable against
 // any host the proxy can reach, so it has to be asked for by name: an empty
@@ -682,6 +692,20 @@ func (s *Store) CountBySSHKeyID(keyID string) int {
 	count := 0
 	for _, t := range s.tokens {
 		if s.isValidLocked(t) && t.SSHKeyID == keyID {
+			count++
+		}
+	}
+	return count
+}
+
+// CountByRootID returns the number of valid tokens in a delegation lineage.
+func (s *Store) CountByRootID(rootID string) int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	count := 0
+	for _, t := range s.tokens {
+		if t.RootTokenID() == rootID && s.isValidLocked(t) {
 			count++
 		}
 	}

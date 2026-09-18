@@ -3,10 +3,12 @@
 package main
 
 import (
+	"net/http/httptest"
 	"testing"
 	"time"
 
 	"github.com/keyfence/keyfence/internal/credstore"
+	"github.com/keyfence/keyfence/internal/policy"
 	"github.com/keyfence/keyfence/internal/tokenstore"
 )
 
@@ -19,10 +21,11 @@ func newReaper() (*credentialReaper, *tokenstore.Store, credstore.Backend) {
 	store := tokenstore.New()
 	creds := credstore.NewEnvBackend()
 	return &credentialReaper{
-		store:   store,
-		creds:   creds,
-		certs:   credstore.NewCertStore(),
-		sshKeys: credstore.NewSSHKeyStore(),
+		store:    store,
+		creds:    creds,
+		certs:    credstore.NewCertStore(),
+		sshKeys:  credstore.NewSSHKeyStore(),
+		policies: policy.NewEngine(),
 	}, store, creds
 }
 
@@ -118,5 +121,38 @@ func TestTheSweepLeavesLiveTokensAlone(t *testing.T) {
 	}
 	if _, err := creds.Fetch(id); err != nil {
 		t.Errorf("a live token's credential was forgotten: %v", err)
+	}
+}
+
+func TestPolicyStateSurvivesAChildButNotTheWholeLineage(t *testing.T) {
+	reaper, store, _ := newReaper()
+	reaper.policies.Register(&policy.Policy{Name: "one", MaxRequests: 1})
+	root, err := store.Issue(tokenstore.IssueParams{
+		AllowedDestinations: []string{"api.example.com"},
+		TTL:                 time.Hour,
+		PolicyName:          "one",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	child, err := store.IssueChild(root.Value, tokenstore.ChildParams{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest("GET", "https://api.example.com/", nil)
+	if deny := reaper.policies.Check("one", root.ID, request); deny != nil {
+		t.Fatalf("first request denied: %v", deny)
+	}
+
+	store.Revoke(child.Value)
+	reaper.forget(child)
+	if deny := reaper.policies.Check("one", root.ID, request); deny == nil {
+		t.Fatal("revoking one child erased policy state shared with its live parent")
+	}
+
+	store.Revoke(root.Value)
+	reaper.forget(root)
+	if deny := reaper.policies.Check("one", root.ID, request); deny != nil {
+		t.Fatalf("policy state survived the entire lineage: %v", deny)
 	}
 }

@@ -201,7 +201,7 @@ func main() {
 	sshKeys := credstore.NewSSHKeyStore()
 	pol := policy.NewEngine()
 
-	reaper := &credentialReaper{store: store, creds: creds, certs: certs, sshKeys: sshKeys}
+	reaper := &credentialReaper{store: store, creds: creds, certs: certs, sshKeys: sshKeys, policies: pol}
 	go reaper.run(ctx, time.Minute)
 
 	// Register built-in policies
@@ -738,10 +738,11 @@ func handleListTokens(store *tokenstore.Store) http.HandlerFunc {
 // token still says "revoked" rather than "never heard of it". It is the periodic
 // pass that eventually forgets the record too.
 type credentialReaper struct {
-	store   *tokenstore.Store
-	creds   credstore.Backend
-	certs   *credstore.CertStore
-	sshKeys *credstore.SSHKeyStore
+	store    *tokenstore.Store
+	creds    credstore.Backend
+	certs    *credstore.CertStore
+	sshKeys  *credstore.SSHKeyStore
+	policies *policy.Engine
 }
 
 // forget drops whatever the given tokens were the last reason to keep.
@@ -760,6 +761,10 @@ func (r *credentialReaper) forget(tokens ...*tokenstore.Token) {
 		}
 		if t.SSHKeyID != "" && r.store.CountBySSHKeyID(t.SSHKeyID) == 0 {
 			_ = r.sshKeys.Delete(t.SSHKeyID)
+		}
+		rootID := t.RootTokenID()
+		if r.policies != nil && r.store.CountByRootID(rootID) == 0 {
+			r.policies.Forget(rootID)
 		}
 	}
 }
