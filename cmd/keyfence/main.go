@@ -75,6 +75,8 @@ func main() {
 	apiKey := flag.String("api-key", "", "require this Bearer token on all control API requests")
 	apiKeyFile := flag.String("api-key-file", "", "read the control API key from this file, so it is not in argv")
 	insecureAPI := flag.Bool("insecure-api", false, "run the control API with no key at all (it can issue and revoke credentials)")
+	knownHosts := flag.String("ssh-known-hosts", "", "known_hosts file used to authenticate upstream SSH hosts (default <data-dir>/ssh/known_hosts)")
+	insecureHostKeys := flag.Bool("ssh-insecure-host-keys", false, "accept any upstream SSH host key (the bastion's key can then be used against an impostor)")
 	flag.Parse()
 
 	controlKey, err := resolveAPIKey(*apiKey, *apiKeyFile)
@@ -182,7 +184,16 @@ func main() {
 
 	// Start SSH bastion
 	sshDir := filepath.Join(*dataDir, "ssh")
-	sshServer, err := sshproxy.New(*sshAddr, sshDir, store, sshKeys, auditLog)
+	knownHostsPath := *knownHosts
+	if knownHostsPath == "" {
+		knownHostsPath = filepath.Join(sshDir, "known_hosts")
+	}
+	if *insecureHostKeys {
+		log.Printf("WARNING: -ssh-insecure-host-keys given. An upstream host is not authenticated, "+
+			"so the private key this bastion holds can be offered to whatever answers %s.", *sshAddr)
+	}
+	sshServer, err := sshproxy.New(*sshAddr, sshDir, store, sshKeys, auditLog,
+		knownHostsPath, *insecureHostKeys)
 	if err != nil {
 		log.Fatalf("ssh: %v", err)
 	}

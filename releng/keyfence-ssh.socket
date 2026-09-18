@@ -2,9 +2,10 @@
 #
 # SPDX-License-Identifier: MIT
 #
-# Not recommended yet: the bastion connects upstream without verifying host
-# keys, so it protects the private key from the agent but does not authenticate
-# the server. Enable it deliberately, not by habit.
+# The bastion authenticates upstream hosts against
+# ~/.keyfence/ssh/known_hosts, so populate that before enabling this:
+#
+#     ssh-keyscan -H github.com >> ~/.keyfence/ssh/known_hosts
 #
 # Enabled, this costs nothing until something connects -- systemd holds the
 # port, and KeyFence is started on the first connection.  Loopback only: a

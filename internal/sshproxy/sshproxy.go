@@ -18,6 +18,7 @@ import (
 	"crypto/rand"
 	"encoding/binary"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -30,6 +31,7 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 	"golang.org/x/crypto/ssh"
+	"golang.org/x/crypto/ssh/knownhosts"
 
 	"github.com/keyfence/keyfence/internal/audit"
 	"github.com/keyfence/keyfence/internal/credstore"
@@ -45,21 +47,31 @@ type Server struct {
 	sshKeys *credstore.SSHKeyStore
 	audit   *audit.Logger
 	config  *ssh.ServerConfig
+
+	// How the host at the far end is authenticated. The bastion holds the
+	// private key so the agent never sees it; if it will then hand that key's
+	// authority to whatever answers the address, the agent's protection is the
+	// only thing it bought.
+	knownHostsPath   string
+	insecureHostKeys bool
 }
 
-// New creates an SSH bastion server. It loads or generates a host key
-// from hostKeyDir.
-func New(addr string, hostKeyDir string, store *tokenstore.Store, sshKeys *credstore.SSHKeyStore, auditLog *audit.Logger) (*Server, error) {
+// New creates an SSH bastion server. It loads or generates a host key from
+// hostKeyDir, and authenticates upstream hosts against knownHostsPath unless
+// insecureHostKeys says not to.
+func New(addr string, hostKeyDir string, store *tokenstore.Store, sshKeys *credstore.SSHKeyStore, auditLog *audit.Logger, knownHostsPath string, insecureHostKeys bool) (*Server, error) {
 	hostKey, err := loadOrCreateHostKey(hostKeyDir)
 	if err != nil {
 		return nil, fmt.Errorf("host key: %w", err)
 	}
 
 	s := &Server{
-		addr:    addr,
-		store:   store,
-		sshKeys: sshKeys,
-		audit:   auditLog,
+		addr:             addr,
+		store:            store,
+		sshKeys:          sshKeys,
+		audit:            auditLog,
+		knownHostsPath:   knownHostsPath,
+		insecureHostKeys: insecureHostKeys,
 	}
 
 	s.config = &ssh.ServerConfig{
@@ -90,6 +102,43 @@ func (s *Server) Serve(ln net.Listener) error {
 		}
 		go s.handleConn(conn)
 	}
+}
+
+// hostKeyPolicy answers how to authenticate the host at the far end.
+//
+// Read per connection rather than once at startup, so that adding a host key is
+// a matter of appending to a file rather than restarting the broker.
+func (s *Server) hostKeyPolicy() (ssh.HostKeyCallback, error) {
+	if s.insecureHostKeys {
+		return ssh.InsecureIgnoreHostKey(), nil
+	}
+	callback, err := knownhosts.New(s.knownHostsPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, fmt.Errorf("no known hosts file at %s; add the upstream's key, "+
+				"for example: ssh-keyscan -H github.com >> %s",
+				s.knownHostsPath, s.knownHostsPath)
+		}
+		return nil, fmt.Errorf("reading %s: %w", s.knownHostsPath, err)
+	}
+	return callback, nil
+}
+
+// describeHostKeyFailure says which of the two quite different things happened:
+// a host nobody has vouched for, or a host whose key is not the one on file.
+func describeHostKeyFailure(err error, hostname, knownHostsPath string) string {
+	var keyErr *knownhosts.KeyError
+	if errors.As(err, &keyErr) {
+		if len(keyErr.Want) == 0 {
+			return fmt.Sprintf("%s is not in %s, so its key cannot be checked; "+
+				"add it with: ssh-keyscan -H %s >> %s",
+				hostname, knownHostsPath, hostname, knownHostsPath)
+		}
+		return fmt.Sprintf("%s presented a host key that does not match %s; "+
+			"either the host changed or something is answering in its place",
+			hostname, knownHostsPath)
+	}
+	return err.Error()
 }
 
 // passwordCallback validates the kf_ token supplied as the SSH password.
@@ -278,15 +327,52 @@ func (s *Server) bridgeSSHSession(token *tokenstore.Token, tokenValue string, ch
 		return
 	}
 
-	// Connect upstream
+	// Connect upstream, having decided how to recognise it first.
+	hostKeys, err := s.hostKeyPolicy()
+	if err != nil {
+		s.audit.Log(audit.Entry{
+			Event:       audit.EventSSHDeny,
+			TokenID:     token.ID,
+			AgentID:     token.AgentID,
+			TaskID:      token.TaskID,
+			Destination: hostname,
+			SSHCommand:  command,
+			DenyRule:    "host_keys_unavailable",
+			DenyReason:  err.Error(),
+		})
+		_, _ = fmt.Fprintf(channel.Stderr(), "%s\r\n", err)
+		sendExitStatus(channel, 1)
+		return
+	}
+
 	clientConfig := &ssh.ClientConfig{
 		User:            sshKey.Username,
 		Auth:            []ssh.AuthMethod{ssh.PublicKeys(signer)},
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+		HostKeyCallback: hostKeys,
 	}
 
 	upstreamConn, err := ssh.Dial("tcp", upstream, clientConfig)
 	if err != nil {
+		// A host key failure is not an ordinary dial failure: one means the
+		// network is unhappy, the other means the key that would have been used
+		// is not going where it was meant to.
+		var keyErr *knownhosts.KeyError
+		if errors.As(err, &keyErr) {
+			reason := describeHostKeyFailure(err, hostname, s.knownHostsPath)
+			s.audit.Log(audit.Entry{
+				Event:       audit.EventSSHDeny,
+				TokenID:     token.ID,
+				AgentID:     token.AgentID,
+				TaskID:      token.TaskID,
+				Destination: hostname,
+				SSHCommand:  command,
+				DenyRule:    "host_key_mismatch",
+				DenyReason:  reason,
+			})
+			_, _ = fmt.Fprintf(channel.Stderr(), "%s\r\n", reason)
+			sendExitStatus(channel, 1)
+			return
+		}
 		s.audit.Log(audit.Entry{
 			Event:       audit.EventSSHDeny,
 			TokenID:     token.ID,

@@ -101,10 +101,10 @@ systemctl --user enable --now keyfence.socket keyfence-api.socket
 That generates a control API key on first start at `~/.keyfence/api-key`,
 readable only by you, and keeps the CA at `~/.keyfence/ca/ca.pem`.
 
-`keyfence-ssh.socket` enables the SSH bastion, and is deliberately not in that
-line: the bastion does not yet verify upstream host keys, so it protects your
-private key from the agent without authenticating the server at the other end.
-Enable it when that is fixed, or when you know the network you are on.
+`keyfence-ssh.socket` enables the SSH bastion. It authenticates upstream hosts
+against `~/.keyfence/ssh/known_hosts`, so populate that first —
+`ssh-keyscan -H github.com >> ~/.keyfence/ssh/known_hosts` — or sessions will be
+refused, which is the correct behaviour rather than a nuisance.
 
 A user service rather than a system one because what KeyFence holds is one
 person's credentials, and the tokens it mints are for that person's agents.
@@ -528,6 +528,23 @@ export GIT_SSH_COMMAND="sshpass -p $KEYFENCE_TOKEN ssh -p 10211 \
 
 git clone git@github.com:owner/repo.git
 ```
+
+The upstream host is authenticated against a known_hosts file, so add the hosts
+the bastion is allowed to reach before using it:
+
+```bash
+ssh-keyscan -H github.com >> ~/.keyfence/ssh/known_hosts
+```
+
+Without an entry, the session is refused and says so — the bastion holds a real
+private key, and offering it to whatever answers an address would undo the point
+of holding it. `-ssh-known-hosts` names a different file;
+`-ssh-insecure-host-keys` waives the check, which is a thing to do deliberately
+and not by default. The file is read per session, so adding a host needs no
+restart.
+
+Note that `StrictHostKeyChecking=no` above applies to the *agent's* hop to the
+bastion on localhost, not to the bastion's hop upstream.
 
 KeyFence resolves the token, fetches the real SSH key, and bridges the session. The private key never enters the agent's address space. Only `exec` requests are supported (no interactive shell or PTY).
 
