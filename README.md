@@ -99,8 +99,12 @@ systemctl --user enable --now keyfence.socket keyfence-api.socket
 ```
 
 That generates a control API key on first start at `~/.keyfence/api-key`,
-readable only by you, and keeps the CA at `~/.keyfence/ca/ca.pem`. Add
-`keyfence-ssh.socket` if you want the SSH bastion.
+readable only by you, and keeps the CA at `~/.keyfence/ca/ca.pem`.
+
+`keyfence-ssh.socket` enables the SSH bastion, and is deliberately not in that
+line: the bastion does not yet verify upstream host keys, so it protects your
+private key from the agent without authenticating the server at the other end.
+Enable it when that is fixed, or when you know the network you are on.
 
 A user service rather than a system one because what KeyFence holds is one
 person's credentials, and the tokens it mints are for that person's agents.
