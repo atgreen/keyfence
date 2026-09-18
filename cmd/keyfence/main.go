@@ -339,6 +339,13 @@ func handleIssueToken(store *tokenstore.Store, creds credstore.Backend, certStor
 			http.Error(w, `{"error":"credential, client_cert, or ssh_private_key is required"}`, 400)
 			return
 		}
+		// A token is worth having because it is worth less than the credential
+		// behind it. One with no destinations is worth exactly as much, so that
+		// has to be asked for rather than defaulted into by leaving a field out.
+		if len(req.Destinations) == 0 {
+			http.Error(w, `{"error":"destinations is required; pass [\"*\"] to issue a token that works anywhere"}`, 400)
+			return
+		}
 
 		// Store the header credential (if provided)
 		var credID string

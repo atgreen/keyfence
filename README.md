@@ -231,6 +231,18 @@ curl -H "Authorization: Bearer $KEYFENCE_API_KEY" \
   }'
 ```
 
+`destinations` is **required**, and an empty list permits nothing. A token is
+worth having because it is worth less than the credential behind it, and one that
+works anywhere is worth exactly as much — so if that is what you want, say it:
+
+```bash
+# Refused: 400, "destinations is required"
+-d '{"credential":"sk-ant-real-key","ttl_seconds":300}'
+
+# A token that works anywhere, asked for by name
+-d '{"credential":"sk-ant-real-key","destinations":["*"],"ttl_seconds":300}'
+```
+
 Response:
 ```json
 {
@@ -302,7 +314,11 @@ Destinations can include URL path restrictions, not just hostnames. This lets yo
 "destinations": ["api.anthropic.com/v1/*"]
 ```
 
-The first `/` in a destination entry separates the host from the path pattern. Host-only entries match all paths (fully backward compatible). Path patterns support glob matching with `/*` for subtree wildcards.
+The first `/` in a destination entry separates the host from the path pattern.
+Host-only entries match all paths. Path patterns support glob matching with `/*`
+for subtree wildcards. The single entry `"*"` means any host and any path, and is
+the only way to ask for that; a `"*"` anywhere in the list widens the whole list,
+so it is not something to mix with named hosts.
 
 ```bash
 # Token that can only call Anthropic's messages endpoint
@@ -310,7 +326,9 @@ curl -X POST http://localhost:10212/tokens \
   -d '{"credential":"sk-ant-key","destinations":["api.anthropic.com/v1/messages"]}'
 ```
 
-SSH bastion (TCP forwarding) destinations are host-only — path scoping applies to HTTPS proxy requests.
+SSH bastion (TCP forwarding) destinations are host-only — path scoping applies to
+HTTPS proxy requests — and a wildcard destination is refused there, because a
+bastion needs a host to connect to rather than a guess.
 
 ## Credential Rotation
 

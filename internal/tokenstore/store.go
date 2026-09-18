@@ -52,16 +52,42 @@ func (t *Token) IsValid() bool {
 	return time.Now().Before(t.ExpiresAt)
 }
 
+// AnyDestination is the destination entry that means "anywhere". A token
+// carrying it is a second copy of the credential it stands for, usable against
+// any host the proxy can reach, so it has to be asked for by name: an empty
+// destination list is not a way to spell it.
+const AnyDestination = "*"
+
+// AllowsAnyDestination answers whether this token was deliberately issued
+// without a destination lock.
+func (t *Token) AllowsAnyDestination() bool {
+	for _, d := range t.AllowedDestinations {
+		if d == AnyDestination {
+			return true
+		}
+	}
+	return false
+}
+
 // IsDestinationAllowed checks whether a request to host+path is permitted.
 // Destination entries can be:
 //   - "api.example.com"          — host only (matches all paths)
 //   - "api.example.com/v1/chat"  — host + exact path
 //   - "api.example.com/v1/*"     — host + path glob
+//   - "*"                        — anywhere, which must be asked for explicitly
+//
+// A token with no destinations at all permits nothing. The point of a token is
+// that it is worth less than the credential behind it, and a token that works
+// everywhere is worth exactly as much -- so if it is going to be that, someone
+// has to have said so.
 func (t *Token) IsDestinationAllowed(host, reqPath string) bool {
 	if len(t.AllowedDestinations) == 0 {
-		return true // no restrictions
+		return false
 	}
 	for _, d := range t.AllowedDestinations {
+		if d == AnyDestination {
+			return true
+		}
 		dHost, dPath := splitDestination(d)
 		if dHost != host {
 			continue

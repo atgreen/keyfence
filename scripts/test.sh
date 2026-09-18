@@ -203,9 +203,20 @@ else
 fi
 
 # --- Test 7: No-destination token (wildcard) ---
-info "test 7: token with no destination restriction"
+# Omitting destinations is refused: an empty list means nothing is permitted, and
+# a token that works anywhere has to be asked for as ["*"].
+info "test 7a: a token with no destinations at all is refused"
+STATUS=$(curl -s -o /dev/null -w '%{http_code}' -X POST http://localhost:10212/tokens \
+    -d "{\"credential\":\"$CRED\",\"ttl_seconds\":60}")
+if [ "$STATUS" = "400" ]; then
+    pass "test 7a: issuing without destinations refused (400)"
+else
+    fail "test 7a: expected 400 for a token with no destinations, got $STATUS"
+fi
+
+info "test 7: token with an explicit wildcard destination"
 WILDCARD_TOKEN=$(curl -sf -X POST http://localhost:10212/tokens \
-    -d "{\"credential\":\"$CRED\",\"ttl_seconds\":60}" | \
+    -d "{\"credential\":\"$CRED\",\"destinations\":[\"*\"],\"ttl_seconds\":60}" | \
     python3 -c "import sys,json; print(json.load(sys.stdin)['token'])")
 
 RESPONSE=$(curl -s -w '\n%{http_code}' \

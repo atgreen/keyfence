@@ -238,7 +238,23 @@ func (s *Server) bridgeSSHSession(token *tokenstore.Token, tokenValue string, ch
 		return
 	}
 
-	// Use first allowed destination
+	// Use first allowed destination. "*" cannot be one: there is no host to
+	// connect to, and a bastion that guessed one would be worse than an error.
+	if token.AllowsAnyDestination() {
+		s.audit.Log(audit.Entry{
+			Event:      audit.EventSSHDeny,
+			TokenID:    token.ID,
+			AgentID:    token.AgentID,
+			TaskID:     token.TaskID,
+			SSHCommand: command,
+			DenyRule:   "any_destination",
+			DenyReason: "ssh sessions need a named host, not a wildcard destination",
+		})
+		_, _ = fmt.Fprintf(channel.Stderr(), "ssh sessions need a named host, not a wildcard destination\r\n")
+		sendExitStatus(channel, 1)
+		return
+	}
+
 	upstream := token.AllowedDestinations[0]
 	if !strings.Contains(upstream, ":") {
 		upstream += ":22"
