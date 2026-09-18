@@ -392,20 +392,60 @@ func (p *Proxy) inspectAndForwardResponse(clientConn net.Conn, resp *http.Respon
 		return
 	}
 
-	// Buffer the body (with size limit) for JSON inspection
-	body, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBuffer))
+	// Nothing to inspect: hand the response straight through. A token with no
+	// response rules, or a body no rule could parse, gains nothing from being
+	// held in memory first -- and a proxy that buffers what it will not look at
+	// is just a slower proxy with a size limit in it.
+	if len(token.ResponseRules) == 0 || !strings.Contains(ct, "application/json") {
+		if err := resp.Write(clientConn); err != nil {
+			log.Printf("write response: %v", err)
+		}
+		return
+	}
+
+	// One byte past the cap, so that reaching the cap is distinguishable from a
+	// body that happens to end exactly on it.
+	prefix, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBuffer+1))
 	if err != nil {
 		log.Printf("read response body: %v", err)
 		return
 	}
-	resp.Body = io.NopCloser(bytes.NewReader(body))
-	resp.ContentLength = int64(len(body))
+
+	if len(prefix) > maxResponseBuffer {
+		// Too large to inspect, so it does not get inspected -- but it does get
+		// delivered whole. Truncating a response to fit a buffer, and rewriting
+		// Content-Length to match, hands the client a body that looks complete
+		// and is not: JSON that parses, a file that is short, and nothing
+		// anywhere saying so.
+		//
+		// The rules are skipped rather than run on a prefix, because a rule that
+		// counts tokens or spends a budget would silently undercount from a
+		// fragment. The audit trail records that they did not run, so an
+		// accounting gap is visible rather than assumed not to exist.
+		resp.Body = io.NopCloser(io.MultiReader(bytes.NewReader(prefix), resp.Body))
+		if err := resp.Write(clientConn); err != nil {
+			log.Printf("write response: %v", err)
+		}
+		p.audit.Log(audit.Entry{
+			Event:      audit.EventResponseRule,
+			TokenID:    token.ID,
+			AgentID:    token.AgentID,
+			TaskID:     token.TaskID,
+			RuleAction: "skipped",
+			RuleReason: fmt.Sprintf("response larger than the %d byte inspection limit; forwarded without evaluating %d rule(s)",
+				maxResponseBuffer, len(token.ResponseRules)),
+		})
+		return
+	}
+
+	resp.Body = io.NopCloser(bytes.NewReader(prefix))
+	resp.ContentLength = int64(len(prefix))
 	if err := resp.Write(clientConn); err != nil {
 		log.Printf("write response: %v", err)
 	}
 
-	if strings.Contains(ct, "application/json") && len(body) > 0 {
-		p.evalResponseRules(token, tokenValue, body, resp)
+	if len(prefix) > 0 {
+		p.evalResponseRules(token, tokenValue, prefix, resp)
 	}
 }
 

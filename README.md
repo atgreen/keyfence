@@ -417,6 +417,17 @@ For LLM streaming responses (`text/event-stream`), KeyFence captures the last SS
 
 ### Sandbox
 
+### What the inspection limit does
+
+A body can only be inspected if it is held in memory, so inspection stops at
+10 MiB. A JSON response larger than that is **forwarded to the client whole and
+unmodified** — the limit never truncates a response — but its rules do not run,
+and the audit trail records that with `rule_action: "skipped"` and the reason. A
+budget that stops counting is worth knowing about; a response that silently
+arrives short is not something to trade for it.
+
+A token with no response rules is streamed straight through and never buffered.
+
 Lua scripts run in a sandboxed VM with no filesystem, network, or OS access. Dangerous functions (`os`, `io`, `require`, `load`, `debug`) are removed. Scripts are terminated after 500ms or 100,000 instructions to prevent infinite loops. Script errors never affect response delivery.
 
 ### Examples

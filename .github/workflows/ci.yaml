@@ -28,6 +28,9 @@ jobs:
       - name: Vet
         run: go vet ./...
 
+      - name: Unit tests
+        run: go test ./...
+
   test:
     runs-on: ubuntu-latest
     needs: build
