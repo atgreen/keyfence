@@ -25,7 +25,10 @@ import (
 //  1. $CREDENTIALS_DIRECTORY/<name> — systemd's credential store, which is what
 //     LoadCredential= and SetCredential= populate. Readable only by the service.
 //  2. <credentials-dir>/<name> — a directory the operator names.
-//  3. KEYFENCE_CREDENTIAL_<NAME> in the environment, upper-cased, which is the
+//  3. the OS keyring, when one is available, under the attributes
+//     service=keyfence credential=<name>. This is the one place a credential is
+//     not plaintext on disk.
+//  4. KEYFENCE_CREDENTIAL_<NAME> in the environment, upper-cased, which is the
 //     convention the env-mapped backend already used.
 //
 // Resolution happens per request rather than at startup, so rotating a credential
@@ -34,6 +37,7 @@ import (
 type NamedStore struct {
 	mu             sync.RWMutex
 	directories    []string
+	keyring        *Keyring
 	environ        func(string) string
 	rejectedReason map[string]string // name → why it cannot be used, for clear errors
 }
@@ -53,6 +57,21 @@ func NewNamedStore(credentialsDir string) *NamedStore {
 		environ:        os.Getenv,
 		rejectedReason: map[string]string{},
 	}
+}
+
+// UseKeyring adds the OS keyring to what this store searches, between the
+// directories and the environment.
+func (n *NamedStore) UseKeyring(keyring *Keyring) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.keyring = keyring
+}
+
+// KeyringEnabled answers whether a keyring is being searched, for diagnostics.
+func (n *NamedStore) KeyringEnabled() bool {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	return n.keyring != nil
 }
 
 // Directories answers where this store looks, for diagnostics.
@@ -106,13 +125,24 @@ func (n *NamedStore) Resolve(name string) (string, error) {
 		return value, nil
 	}
 
+	n.mu.RLock()
+	keyring := n.keyring
+	n.mu.RUnlock()
+	if keyring != nil {
+		if value, err := keyring.Resolve(name); err == nil {
+			return value, nil
+		}
+	}
+
 	variable := "KEYFENCE_CREDENTIAL_" + strings.ToUpper(strings.NewReplacer("-", "_", ".", "_").Replace(name))
 	if value := n.environ(variable); value != "" {
 		return value, nil
 	}
 
-	return "", fmt.Errorf("no credential named %q: looked in %s and for %s",
-		name, n.describeDirectories(), variable)
+	return "", fmt.Errorf("no credential named %q: looked in %s%s and for %s",
+		name, n.describeDirectories(),
+		map[bool]string{true: ", in the keyring", false: ""}[keyring != nil],
+		variable)
 }
 
 // Has answers whether a name resolves, without handing back what it resolves to.
@@ -139,6 +169,15 @@ func (n *NamedStore) Names() []string {
 			}
 		}
 	}
+	n.mu.RLock()
+	keyring := n.keyring
+	n.mu.RUnlock()
+	if keyring != nil {
+		for _, name := range keyring.Names() {
+			seen[name] = struct{}{}
+		}
+	}
+
 	names := make([]string, 0, len(seen))
 	for name := range seen {
 		names = append(names, name)

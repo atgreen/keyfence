@@ -125,3 +125,7 @@ func TestNamesListsWhatIsRegisteredWithoutValues(t *testing.T) {
 		t.Errorf("got %v, want [anthropic github]", names)
 	}
 }
+
+func contains(haystack, needle string) bool {
+	return strings.Contains(haystack, needle)
+}

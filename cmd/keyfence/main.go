@@ -76,6 +76,7 @@ func main() {
 	apiKeyFile := flag.String("api-key-file", "", "read the control API key from this file, so it is not in argv")
 	insecureAPI := flag.Bool("insecure-api", false, "run the control API with no key at all (it can issue and revoke credentials)")
 	noReuse := flag.Bool("no-reuse-connections", false, "close each tunnel after one request instead of keeping it for the next")
+	useKeyring := flag.Bool("keyring", false, "also resolve named credentials from the OS keyring (service=keyfence credential=<name>), which keeps them off disk in plaintext")
 	passthrough := flag.String("passthrough", "", "comma-separated hosts reachable through the proxy without a token (nothing is injected for them)")
 	credentialsDir := flag.String("credentials-dir", "", "directory of credentials registered by name, resolved per request (systemd's $CREDENTIALS_DIRECTORY is always searched)")
 	knownHosts := flag.String("ssh-known-hosts", "", "known_hosts file used to authenticate upstream SSH hosts (default <data-dir>/ssh/known_hosts)")
@@ -146,6 +147,15 @@ func main() {
 	// Credentials the operator registered by name, which a client can ask for
 	// without ever holding: it says "anthropic", and the bytes stay here.
 	named := credstore.NewNamedStore(*credentialsDir)
+	if *useKeyring {
+		if keyring := credstore.NewKeyring(0); keyring != nil {
+			named.UseKeyring(keyring)
+			log.Printf("keyring: resolving credentials from the OS keyring as well")
+		} else {
+			log.Printf("keyring: -keyring given but secret-tool is not installed; " +
+				"install libsecret-tools, or leave credentials in files")
+		}
+	}
 	if directories := named.Directories(); len(directories) > 0 {
 		log.Printf("named credentials from %v; %d registered", directories, len(named.Names()))
 	}

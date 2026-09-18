@@ -300,9 +300,35 @@ handed the secret by something that held it first*. A client minting a token by
 reference never possesses the credential at all — it says `anthropic`, and the
 bytes never leave the broker.
 
-Three places are searched, in order: `$CREDENTIALS_DIRECTORY/<name>` (which is
-what systemd's `LoadCredential=` populates, readable only by the service),
-`<credentials-dir>/<name>`, and `KEYFENCE_CREDENTIAL_<NAME>` in the environment.
+Four places are searched, in order: `$CREDENTIALS_DIRECTORY/<name>` (which is
+what systemd's `LoadCredential=` populates), `<credentials-dir>/<name>`, the OS
+keyring with `-keyring`, and `KEYFENCE_CREDENTIAL_<NAME>` in the environment.
+
+### The keyring, so credentials are not plaintext on disk
+
+`-keyring` resolves names from the OS keyring as well:
+
+```bash
+gh auth token | tr -d '\n' | \
+  secret-tool store --label="keyfence: github" service keyfence credential github
+keyfence -keyring ...
+```
+
+A credential in a file is plaintext on disk, and mode 0600 does nothing about a
+backup, a snapshot, or a disk read while nobody is logged in. The keyring keeps it
+encrypted until the session unlocks it, which is the reason to prefer it.
+
+Be clear about what it does not give: the Secret Service API answers any process
+running as you, so a keyring entry is no harder for a same-uid process to read
+than a 0600 file. Encryption at rest is the benefit. (Neither is reachable from a
+sandbox, which has no D-Bus and no grant for the path.)
+
+Lookups go through `secret-tool` rather than a D-Bus client here, which keeps a
+D-Bus stack out of the process holding the credentials, and are cached for a
+minute so that a request is not a subprocess. Rotation therefore takes up to a
+minute rather than being instant. A locked keyring means no lookups until the
+session unlocks — so for a machine that must come up unattended, files or systemd
+credentials are the better answer.
 
 Resolution happens per request, so **rotation is replacing a file** — the next
 request carries the new value and nothing has to be reissued. A name is a name,
