@@ -383,7 +383,14 @@ func (p *Proxy) processRequest(ctx context.Context, clientConn net.Conn, req *ht
 			DenyReason:  fmt.Sprintf("no keyfence token found in request headers, and %s is not a passthrough host", targetHost),
 		})
 		span.SetStatus(codes.Error, "no_token")
-		writeError(clientConn, 401, "no keyfence token found in request headers")
+		// With the challenge, because 401 means "authenticate" and a client that
+		// waits to be asked has to be asked. git is one: it sends no credential
+		// on its first request and offers Basic only in answer to
+		// WWW-Authenticate, so without this header a git clone through the proxy
+		// failed with "Authentication failed" having never sent the token it had.
+		writeErrorWithHeaders(clientConn, 401,
+			"no keyfence token found in request headers",
+			map[string]string{"WWW-Authenticate": `Basic realm="keyfence"`})
 		return false
 	}
 
@@ -918,10 +925,18 @@ func findToken(req *http.Request) (tokenValue, headerKey string) {
 }
 
 func writeError(conn net.Conn, status int, message string) {
+	writeErrorWithHeaders(conn, status, message, nil)
+}
+
+// writeErrorWithHeaders is writeError with extra headers, which one refusal needs.
+func writeErrorWithHeaders(conn net.Conn, status int, message string, extra map[string]string) {
 	body := fmt.Sprintf(`{"error":"%s"}`, message)
-	resp := fmt.Sprintf("HTTP/1.1 %d %s\r\nContent-Type: application/json\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s",
-		status, http.StatusText(status), len(body), body)
-	_, _ = conn.Write([]byte(resp))
+	head := fmt.Sprintf("HTTP/1.1 %d %s\r\nContent-Type: application/json\r\nContent-Length: %d\r\nConnection: close\r\n",
+		status, http.StatusText(status), len(body))
+	for name, value := range extra {
+		head += fmt.Sprintf("%s: %s\r\n", name, value)
+	}
+	_, _ = conn.Write([]byte(head + "\r\n" + body))
 }
 
 func writeJSON(conn net.Conn, status int, body string) {

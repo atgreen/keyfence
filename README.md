@@ -199,6 +199,13 @@ user, which is why a file is better. Under systemd, `LoadCredential=` puts one
 in `$CREDENTIALS_DIRECTORY` and KeyFence looks there for `api-key` without being
 told to.
 
+A request with no `kf_` token is refused with 401 and a
+`WWW-Authenticate: Basic` challenge, because that is what 401 means and some
+clients wait to be asked. git is one: it sends no credential on its first request
+and offers Basic only in answer to a challenge, so without the header a clone
+through the proxy failed with "Authentication failed" having never sent the token
+it was holding.
+
 All control API endpoints except `/health` require the key as a Bearer token:
 
 ```bash
