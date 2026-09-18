@@ -231,6 +231,19 @@ Requests to those hosts are forwarded as they came: no token required, nothing
 injected, and recorded in the audit trail with `"label":"passthrough"` so what
 left without one is visible. Everything else still needs a token.
 
+Some hosts cannot be named in advance — Codex fetches its plugin bundles from
+`sdmntprsouthcentralus.oaiusercontent.com`, a per-region name you would learn only
+by being refused first. For those, name a domain:
+
+```bash
+keyfence -passthrough 'chatgpt.com,*.oaiusercontent.com'
+```
+
+`*.oaiusercontent.com` matches any host under that domain, at a label boundary:
+`cdn.oaiusercontent.com` yes, `notoaiusercontent.com` no. It does not match bare
+`oaiusercontent.com` — a pattern for subdomains says nothing about the domain
+itself — so name both if you want both.
+
 ### Cleartext HTTP
 
 All four ways in work for `http://` as well as `https://`: an explicit proxy

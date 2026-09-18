@@ -83,7 +83,7 @@ func main() {
 	insecureAPI := flag.Bool("insecure-api", false, "run the control API with no key at all (it can issue and revoke credentials)")
 	noReuse := flag.Bool("no-reuse-connections", false, "close each tunnel after one request instead of keeping it for the next")
 	useKeyring := flag.Bool("keyring", false, "also resolve named credentials from the OS keyring (service=keyfence credential=<name>), which keeps them off disk in plaintext")
-	passthrough := flag.String("passthrough", "", "comma-separated hosts reachable through the proxy without a token (nothing is injected for them)")
+	passthrough := flag.String("passthrough", "", "comma-separated hosts reachable through the proxy without a token, with *.example.com matching subdomains (nothing is injected for them)")
 	credentialsDir := flag.String("credentials-dir", "", "directory of credentials registered by name, resolved per request (systemd's $CREDENTIALS_DIRECTORY is always searched)")
 	knownHosts := flag.String("ssh-known-hosts", "", "known_hosts file used to authenticate upstream SSH hosts (default <data-dir>/ssh/known_hosts)")
 	insecureHostKeys := flag.Bool("ssh-insecure-host-keys", false, "accept any upstream SSH host key (the bastion's key can then be used against an impostor)")

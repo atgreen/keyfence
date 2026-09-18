@@ -74,6 +74,11 @@ type Proxy struct {
 	audit    *audit.Logger
 	lua      *luaengine.Engine
 	addr     string
+
+	// passthroughSuffixes are the ".example.com" forms, matched at a label
+	// boundary. Kept beside the exact set rather than in it, because a map
+	// lookup cannot answer a suffix question.
+	passthroughSuffixes []string
 }
 
 // normaliseHost answers a host name in the one form the passthrough set is keyed
@@ -82,26 +87,64 @@ func normaliseHost(host string) string {
 	return strings.ToLower(strings.TrimSpace(host))
 }
 
+// passedThrough answers whether a host was named as needing no credential.
+//
+// Exact names are the common case. A suffix pattern exists for the hosts nobody
+// can enumerate: codex downloads its plugin bundles from
+// sdmntprsouthcentralus.oaiusercontent.com, a per-region name that would have to
+// be discovered by being refused first. Written "*.oaiusercontent.com" or
+// ".oaiusercontent.com", it matches any host under that domain.
+//
+// Matching is at a label boundary, so "*.example.com" covers "cdn.example.com"
+// and not "example.com.evil.test" or "notexample.com". It does not cover bare
+// "example.com" either: a pattern for subdomains says nothing about the domain
+// itself, and a control that silently widened would be the wrong kind of
+// convenient. Name both if you want both.
+func (p *Proxy) passedThrough(host string) bool {
+	name := normaliseHost(host)
+	if name == "" {
+		return false
+	}
+	if p.passthrough[name] {
+		return true
+	}
+	for _, suffix := range p.passthroughSuffixes {
+		if strings.HasSuffix(name, suffix) && len(name) > len(suffix) {
+			return true
+		}
+	}
+	return false
+}
+
 // Connection reuse is on unless -no-reuse-connections says otherwise. It was
 // briefly opt-in while a client breakage was blamed on it; the cause turned out
 // to be the upstream protocol, not reuse. The flag stays as somewhere to stand if
 // a client ever disagrees.
 func New(addr string, ca *CA, store *tokenstore.Store, creds credstore.Backend, certs *credstore.CertStore, pol *policy.Engine, auditLog *audit.Logger, named *credstore.NamedStore, passthrough []string, reuse bool) *Proxy {
 	allowed := make(map[string]bool, len(passthrough))
+	var suffixes []string
 	for _, host := range passthrough {
-		if name := normaliseHost(host); name != "" {
+		name := normaliseHost(host)
+		switch {
+		case name == "":
+		case strings.HasPrefix(name, "*."):
+			suffixes = append(suffixes, name[1:]) // "*.example.com" -> ".example.com"
+		case strings.HasPrefix(name, "."):
+			suffixes = append(suffixes, name)
+		default:
 			allowed[name] = true
 		}
 	}
 	return &Proxy{
-		ca:          ca,
-		store:       store,
-		creds:       creds,
-		certs:       certs,
-		policy:      pol,
-		named:       named,
-		passthrough: allowed,
-		reuse:       reuse,
+		ca:                  ca,
+		store:               store,
+		creds:               creds,
+		certs:               certs,
+		policy:              pol,
+		named:               named,
+		passthrough:         allowed,
+		passthroughSuffixes: suffixes,
+		reuse:               reuse,
 		upstream: &http.Transport{
 			TLSHandshakeTimeout:   10 * time.Second,
 			ResponseHeaderTimeout: 30 * time.Second,
@@ -361,7 +404,7 @@ func (p *Proxy) processRequest(ctx context.Context, clientConn net.Conn, req *ht
 
 	// Find kf_ token in any header
 	tokenValue, tokenHeader := findToken(req)
-	if tokenValue == "" && p.passthrough[normaliseHost(targetHost)] {
+	if tokenValue == "" && p.passedThrough(targetHost) {
 		// Named as needing no credential. Forwarded as it came, with nothing
 		// added, and recorded so that what went out without a token is visible.
 		p.audit.Log(audit.Entry{
