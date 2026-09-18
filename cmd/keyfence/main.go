@@ -62,6 +62,12 @@ import (
 )
 
 func main() {
+	// "keyfence credential ..." sets one up and exits; anything else starts the
+	// broker as before.
+	if handled, status := runCredentialCommand(os.Args[1:]); handled {
+		os.Exit(status)
+	}
+
 	// Loopback by default. The control API issues credentials, and the proxy
 	// carries them; neither is something to publish on every interface because
 	// nobody said otherwise. Pass an explicit address to widen it -- in a pod,
@@ -243,6 +249,17 @@ func main() {
 	mux.HandleFunc("DELETE /tokens/{token}", requireAPIKey(controlKey, handleRevokeToken(store, auditLog, reaper)))
 	mux.HandleFunc("DELETE /tasks/{task_id}/tokens", requireAPIKey(controlKey, handleRevokeByTask(store, auditLog)))
 	mux.HandleFunc("GET /policies", requireAPIKey(controlKey, handleListPolicies(pol)))
+	// What is registered, by name. Never a value: an operator asking "can the
+	// broker use the github credential" should not have to cause an error to find
+	// out, which was the only way before this existed.
+	mux.HandleFunc("GET /credentials", requireAPIKey(controlKey, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"credentials": named.Names(),
+			"sources":     named.Directories(),
+			"keyring":     named.KeyringEnabled(),
+		})
+	}))
 	mux.HandleFunc("PUT /credentials/{id}", requireAPIKey(controlKey, handleRotateCredential(creds, store, auditLog)))
 	mux.HandleFunc("PUT /credentials/{id}/cert", requireAPIKey(controlKey, handleRotateCert(certs, auditLog)))
 	mux.HandleFunc("PUT /credentials/{id}/sshkey", requireAPIKey(controlKey, handleRotateSSHKey(sshKeys, auditLog)))

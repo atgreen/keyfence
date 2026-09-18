@@ -309,10 +309,16 @@ keyring with `-keyring`, and `KEYFENCE_CREDENTIAL_<NAME>` in the environment.
 `-keyring` resolves names from the OS keyring as well:
 
 ```bash
-gh auth token | tr -d '\n' | \
-  secret-tool store --label="keyfence: github" service keyfence credential github
+gh auth token | keyfence credential add github
+keyfence credential list
 keyfence -keyring ...
 ```
+
+`credential add` reads the secret from stdin and puts it in the keyring, so
+nobody has to know that the attributes are `service keyfence credential <name>`;
+`--file PATH` writes a file instead. `credential list` asks the running broker
+what it can see and where from, which is also what `GET /credentials` answers --
+names only, never values.
 
 A credential in a file is plaintext on disk, and mode 0600 does nothing about a
 backup, a snapshot, or a disk read while nobody is logged in. The keyring keeps it
