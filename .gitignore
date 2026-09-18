@@ -8,3 +8,4 @@ PRD.md
 *.db
 .beads-credential-key
 .beads/proxieddb/
+/build/

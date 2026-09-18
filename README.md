@@ -86,7 +86,16 @@ sudo dnf install keyfence
 ```
 
 Or take a binary from the [releases](https://github.com/atgreen/keyfence/releases),
-or `make build` from source.
+or build from source — `make build` for the binary, `make rpm` for a package of
+whatever is checked out, no tag or release required:
+
+```bash
+make rpm        # build/rpm/RPMS/*/keyfence-*.rpm
+```
+
+The release workflow can also be run by hand from the Actions tab, which builds
+and uploads an RPM as an artifact; only a tag push publishes a release or updates
+the repository metadata.
 
 ### As a user service (recommended)
 
