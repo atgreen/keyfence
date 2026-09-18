@@ -233,7 +233,26 @@ func (s *Server) handleSession(token *tokenstore.Token, tokenValue string, chann
 			}
 
 		default:
-			// Reject shell, pty-req, subsystem, etc.
+			// Reject shell, pty-req, subsystem and the rest. The bastion bridges
+			// a command to an upstream host; it is not a shell on this machine,
+			// and an interactive session is not something it could usefully
+			// forward. Saying so beats "shell request failed on channel 0",
+			// which is what a client prints when a request is refused silently.
+			if req.Type == "shell" {
+				// Accepted so that the explanation is seen. A client discards
+				// channel output for a request that was refused, and prints its
+				// own "shell request failed on channel 0" instead -- which says
+				// nothing about what this does accept.
+				if req.WantReply {
+					_ = req.Reply(true, nil)
+				}
+				_, _ = fmt.Fprint(channel.Stderr(),
+					"keyfence bridges a command to an upstream host, not an "+
+						"interactive shell.\r\nUse: ssh HOST COMMAND -- which is "+
+						"what git does.\r\n")
+				sendExitStatus(channel, 1)
+				return
+			}
 			if req.WantReply {
 				_ = req.Reply(false, nil)
 			}
@@ -383,7 +402,10 @@ func (s *Server) bridgeSSHSession(token *tokenstore.Token, tokenValue string, ch
 			DenyRule:    "upstream_error",
 			DenyReason:  fmt.Sprintf("upstream ssh dial: %v", err),
 		})
-		_, _ = fmt.Fprintf(channel.Stderr(), "upstream connection failed\r\n")
+		// The reason, not just the fact: it was in the audit trail and the client
+		// was told "upstream connection failed", which is the one thing it already
+		// knew.
+		_, _ = fmt.Fprintf(channel.Stderr(), "upstream connection failed: %v\r\n", err)
 		sendExitStatus(channel, 1)
 		return
 	}

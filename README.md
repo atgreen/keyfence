@@ -674,6 +674,10 @@ the bastion is allowed to reach before using it:
 ssh-keyscan -H github.com >> ~/.keyfence/ssh/known_hosts
 ```
 
+Only a command is bridged — `ssh HOST COMMAND`, which is what git does. An
+interactive shell is refused with an explanation, since the bastion forwards to an
+upstream host and is not a shell on this machine.
+
 Without an entry, the session is refused and says so — the bastion holds a real
 private key, and offering it to whatever answers an address would undo the point
 of holding it. `-ssh-known-hosts` names a different file;
