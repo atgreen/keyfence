@@ -224,6 +224,13 @@ Requests to those hosts are forwarded as they came: no token required, nothing
 injected, and recorded in the audit trail with `"label":"passthrough"` so what
 left without one is visible. Everything else still needs a token.
 
+### Cleartext HTTP
+
+All four ways in work for `http://` as well as `https://`: an explicit proxy
+(`HTTP_PROXY`, an absolute-URI request), and a redirected connection, where the
+`Host` header says where it was going instead of the SNI. The credential swap is
+the same — a `kf_` token in any header value is replaced.
+
 ### Where it listens
 
 The proxy, the SSH bastion and the control API bind **loopback** by default

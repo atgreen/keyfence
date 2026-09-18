@@ -168,7 +168,7 @@ func (p *Proxy) handleConn(conn net.Conn) {
 	if err != nil {
 		return
 	}
-	if first[0] == 0x16 {
+	if looksLikeTLS(first[0]) {
 		p.serveRedirectedTLS(&bufferedConn{Reader: br, Conn: conn})
 		return
 	}
@@ -189,6 +189,17 @@ func (p *Proxy) handleConn(conn net.Conn) {
 	default:
 		writeError(conn, 400, "keyfence is an HTTPS proxy. Set HTTPS_PROXY=http://127.0.0.1"+p.addr+" and use https:// URLs")
 	}
+}
+
+// looksLikeTLS answers whether a connection begins with a TLS record rather than
+// an HTTP request.
+//
+// 0x16 is the TLS handshake record type. No HTTP method begins with it -- they are
+// all upper-case letters -- so one byte separates a client that asked for a tunnel
+// from one that was redirected here and is talking TLS at what it thinks it
+// dialled.
+func looksLikeTLS(first byte) bool {
+	return first == 0x16
 }
 
 // bufferedConn is a connection whose first bytes have already been read into a
