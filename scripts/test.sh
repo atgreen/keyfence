@@ -22,9 +22,19 @@ NC='\033[0m'
 pass() { echo -e "${GREEN}PASS${NC} $1"; }
 fail() { echo -e "${RED}FAIL${NC} $1"; FAILURES=$((FAILURES+1)); }
 info() { echo -e "${YELLOW}----${NC} $1"; }
+skip() { echo -e "${YELLOW}SKIP${NC} $1"; SKIPPED=$((SKIPPED+1)); }
 
 FAILURES=0
+SKIPPED=0
 DATA_DIR=$(mktemp -d)
+
+# Deliberately not 10210/10212. A developer running KeyFence as a service has
+# those, and a suite that quietly talked to it instead of to the instance it
+# started would test the wrong process with the wrong CA -- which looks like a
+# certificate failure and is not one.
+PROXY_PORT="${KEYFENCE_TEST_PROXY_PORT:-10310}"
+API_PORT="${KEYFENCE_TEST_API_PORT:-10312}"
+SSH_PORT="${KEYFENCE_TEST_SSH_PORT:-10311}"
 
 cleanup() {
     info "cleaning up..."
@@ -40,16 +50,25 @@ mkdir -p ./bin
 go build -o ./bin/keyfence ./cmd/keyfence
 
 # --- Start KeyFence ---
-info "starting keyfence (data-dir=$DATA_DIR)..."
+for port in "$PROXY_PORT" "$API_PORT" "$SSH_PORT"; do
+    if curl -s -o /dev/null --max-time 2 "http://127.0.0.1:$port" 2>/dev/null \
+       || (command -v ss >/dev/null && ss -ltn 2>/dev/null | grep -q ":$port "); then
+        echo "port $port is already in use; set KEYFENCE_TEST_PROXY_PORT," \
+             "KEYFENCE_TEST_API_PORT and KEYFENCE_TEST_SSH_PORT to free ones"
+        exit 1
+    fi
+done
+
+info "starting keyfence (data-dir=$DATA_DIR, api=:$API_PORT)..."
 # --insecure-api: the control API refuses to run without a key, and these tests
 # talk to it directly. Unauthenticated is fine here, and now it has to be said.
-./bin/keyfence --insecure-api --data-dir "$DATA_DIR" --proxy 127.0.0.1:10210 --api 127.0.0.1:10212 &
+./bin/keyfence --insecure-api --data-dir "$DATA_DIR" --proxy "127.0.0.1:$PROXY_PORT" --api "127.0.0.1:$API_PORT" --ssh "127.0.0.1:$SSH_PORT" &
 KEYFENCE_PID=$!
 sleep 1
 
 # Check it's running
-if ! curl -sf http://localhost:10212/health > /dev/null 2>&1; then
-    fail "keyfence not responding on :10212"
+if ! curl -sf http://localhost:$API_PORT/health > /dev/null 2>&1; then
+    fail "keyfence not responding on :$API_PORT"
     exit 1
 fi
 pass "keyfence running"
@@ -77,12 +96,23 @@ else
     EXPECT_UPSTREAM_AUTH=true
 fi
 
+# Most tests are answered by the proxy itself -- a refused token, a wrong
+# destination, a policy denial -- and need nothing outside this machine. Two
+# require the real upstream to answer, so they are skipped rather than failed
+# where it cannot be reached.
+if curl -s -o /dev/null --max-time 8 https://api.anthropic.com/ 2>/dev/null; then
+    UPSTREAM_REACHABLE=true
+else
+    UPSTREAM_REACHABLE=false
+    info "api.anthropic.com is not reachable; tests that need it will be skipped"
+fi
+
 # All tests use MITM proxy mode (HTTPS_PROXY + CONNECT)
 
 # --- Test 1: No token → 401 ---
 info "test 1: request without token → 401"
 STATUS=$(curl -s -o /dev/null -w '%{http_code}' \
-    --proxy http://127.0.0.1:10210 \
+    --proxy http://127.0.0.1:$PROXY_PORT \
     --cacert "$CA_CERT" \
     https://api.anthropic.com/v1/messages \
     -H "Content-Type: application/json" \
@@ -95,8 +125,11 @@ else
 fi
 
 # --- Test 2: Issue token, make request ---
+if [ "$UPSTREAM_REACHABLE" != "true" ]; then
+    skip "test 2: needs api.anthropic.com to answer"
+else
 info "test 2: issue token and make authenticated request"
-TOKEN=$(curl -sf -X POST http://localhost:10212/tokens \
+TOKEN=$(curl -sf -X POST http://localhost:$API_PORT/tokens \
     -d "{\"credential\":\"$CRED\",\"destinations\":[\"api.anthropic.com\"],\"ttl_seconds\":60}" | \
     python3 -c "import sys,json; print(json.load(sys.stdin)['token'])")
 
@@ -105,14 +138,16 @@ if [ -z "$TOKEN" ]; then
 else
     info "issued token: ${TOKEN:0:30}..."
 
+    # GET /v1/models rather than POST /v1/messages: what this test is about is
+    # whether the token was swapped for the real credential, and a model name is
+    # a dependency on Anthropic's catalogue that goes stale and spends tokens
+    # proving nothing. An authenticated metadata call answers the same question.
     RESPONSE=$(curl -s -w '\n%{http_code}' \
-        --proxy http://127.0.0.1:10210 \
+        --proxy http://127.0.0.1:$PROXY_PORT \
         --cacert "$CA_CERT" \
-        https://api.anthropic.com/v1/messages \
-        -H "Content-Type: application/json" \
+        https://api.anthropic.com/v1/models \
         -H "x-api-key: $TOKEN" \
-        -H "anthropic-version: 2023-06-01" \
-        -d '{"model":"claude-sonnet-4-20250514","max_tokens":5,"messages":[{"role":"user","content":"say hi"}]}')
+        -H "anthropic-version: 2023-06-01")
 
     STATUS=$(echo "$RESPONSE" | tail -n 1)
 
@@ -129,16 +164,18 @@ else
     fi
 fi
 
+fi
+
 # --- Test 3: Expired token → 403 ---
 info "test 3: expired token → 403"
-EXPIRED_TOKEN=$(curl -sf -X POST http://localhost:10212/tokens \
+EXPIRED_TOKEN=$(curl -sf -X POST http://localhost:$API_PORT/tokens \
     -d "{\"credential\":\"$CRED\",\"destinations\":[\"api.anthropic.com\"],\"ttl_seconds\":1}" | \
     python3 -c "import sys,json; print(json.load(sys.stdin)['token'])")
 
 sleep 2
 
 STATUS=$(curl -s -o /dev/null -w '%{http_code}' \
-    --proxy http://127.0.0.1:10210 \
+    --proxy http://127.0.0.1:$PROXY_PORT \
     --cacert "$CA_CERT" \
     https://api.anthropic.com/v1/messages \
     -H "Content-Type: application/json" \
@@ -154,12 +191,17 @@ fi
 
 # --- Test 4: Wrong destination → 403 ---
 info "test 4: token for anthropic used against openai → 403"
+# Its own token rather than test 2's: a test that borrows another's state fails
+# for the wrong reason the moment that one is skipped.
+DEST_TOKEN=$(curl -sf -X POST http://localhost:$API_PORT/tokens \
+    -d "{\"credential\":\"$CRED\",\"destinations\":[\"api.anthropic.com\"],\"ttl_seconds\":300}" | \
+    python3 -c "import sys,json; print(json.load(sys.stdin)['token'])")
 STATUS=$(curl -s -o /dev/null -w '%{http_code}' \
-    --proxy http://127.0.0.1:10210 \
+    --proxy http://127.0.0.1:$PROXY_PORT \
     --cacert "$CA_CERT" \
     https://api.openai.com/v1/chat/completions \
     -H "Content-Type: application/json" \
-    -H "Authorization: Bearer $TOKEN" \
+    -H "Authorization: Bearer $DEST_TOKEN" \
     -d '{"model":"gpt-4","messages":[{"role":"user","content":"hi"}]}')
 
 if [ "$STATUS" = "403" ]; then
@@ -170,14 +212,14 @@ fi
 
 # --- Test 5: Token revocation ---
 info "test 5: revoked token → 403"
-REVOKE_TOKEN=$(curl -sf -X POST http://localhost:10212/tokens \
+REVOKE_TOKEN=$(curl -sf -X POST http://localhost:$API_PORT/tokens \
     -d "{\"credential\":\"$CRED\",\"destinations\":[\"api.anthropic.com\"],\"ttl_seconds\":300}" | \
     python3 -c "import sys,json; print(json.load(sys.stdin)['token'])")
 
-curl -sf -X DELETE "http://localhost:10212/tokens/$REVOKE_TOKEN" > /dev/null
+curl -sf -X DELETE "http://localhost:$API_PORT/tokens/$REVOKE_TOKEN" > /dev/null
 
 STATUS=$(curl -s -o /dev/null -w '%{http_code}' \
-    --proxy http://127.0.0.1:10210 \
+    --proxy http://127.0.0.1:$PROXY_PORT \
     --cacert "$CA_CERT" \
     https://api.anthropic.com/v1/messages \
     -H "Content-Type: application/json" \
@@ -193,7 +235,7 @@ fi
 
 # --- Test 6: List tokens ---
 info "test 6: list tokens returns valid JSON array"
-LIST_RESPONSE=$(curl -sf http://localhost:10212/tokens)
+LIST_RESPONSE=$(curl -sf http://localhost:$API_PORT/tokens)
 TOKEN_COUNT=$(echo "$LIST_RESPONSE" | python3 -c "import sys,json; print(len(json.load(sys.stdin)))")
 
 if [ "$TOKEN_COUNT" -gt 0 ]; then
@@ -206,7 +248,7 @@ fi
 # Omitting destinations is refused: an empty list means nothing is permitted, and
 # a token that works anywhere has to be asked for as ["*"].
 info "test 7a: a token with no destinations at all is refused"
-STATUS=$(curl -s -o /dev/null -w '%{http_code}' -X POST http://localhost:10212/tokens \
+STATUS=$(curl -s -o /dev/null -w '%{http_code}' -X POST http://localhost:$API_PORT/tokens \
     -d "{\"credential\":\"$CRED\",\"ttl_seconds\":60}")
 if [ "$STATUS" = "400" ]; then
     pass "test 7a: issuing without destinations refused (400)"
@@ -214,19 +256,20 @@ else
     fail "test 7a: expected 400 for a token with no destinations, got $STATUS"
 fi
 
+if [ "$UPSTREAM_REACHABLE" != "true" ]; then
+    skip "test 7: needs api.anthropic.com to answer"
+else
 info "test 7: token with an explicit wildcard destination"
-WILDCARD_TOKEN=$(curl -sf -X POST http://localhost:10212/tokens \
+WILDCARD_TOKEN=$(curl -sf -X POST http://localhost:$API_PORT/tokens \
     -d "{\"credential\":\"$CRED\",\"destinations\":[\"*\"],\"ttl_seconds\":60}" | \
     python3 -c "import sys,json; print(json.load(sys.stdin)['token'])")
 
 RESPONSE=$(curl -s -w '\n%{http_code}' \
-    --proxy http://127.0.0.1:10210 \
+    --proxy http://127.0.0.1:$PROXY_PORT \
     --cacert "$CA_CERT" \
-    https://api.anthropic.com/v1/messages \
-    -H "Content-Type: application/json" \
+    https://api.anthropic.com/v1/models \
     -H "x-api-key: $WILDCARD_TOKEN" \
-    -H "anthropic-version: 2023-06-01" \
-    -d '{"model":"claude-sonnet-4-20250514","max_tokens":5,"messages":[{"role":"user","content":"say hi"}]}')
+    -H "anthropic-version: 2023-06-01")
 
 STATUS=$(echo "$RESPONSE" | tail -n 1)
 
@@ -236,14 +279,16 @@ else
     fail "test 7: unexpected status $STATUS"
 fi
 
+fi
+
 # --- Test 8: Readonly policy blocks POST ---
 info "test 8: readonly policy blocks POST requests"
-READONLY_TOKEN=$(curl -sf -X POST http://localhost:10212/tokens \
+READONLY_TOKEN=$(curl -sf -X POST http://localhost:$API_PORT/tokens \
     -d "{\"credential\":\"$CRED\",\"destinations\":[\"api.anthropic.com\"],\"ttl_seconds\":60,\"policy\":\"readonly\"}" | \
     python3 -c "import sys,json; print(json.load(sys.stdin)['token'])")
 
 STATUS=$(curl -s -o /dev/null -w '%{http_code}' \
-    --proxy http://127.0.0.1:10210 \
+    --proxy http://127.0.0.1:$PROXY_PORT \
     --cacert "$CA_CERT" \
     https://api.anthropic.com/v1/messages \
     -H "Content-Type: application/json" \
@@ -259,7 +304,7 @@ fi
 
 # --- Test 9: List policies ---
 info "test 9: list policies returns built-in policies"
-POLICY_COUNT=$(curl -sf http://localhost:10212/policies | \
+POLICY_COUNT=$(curl -sf http://localhost:$API_PORT/policies | \
     python3 -c "import sys,json; print(len(json.load(sys.stdin)))")
 
 if [ "$POLICY_COUNT" -ge 4 ]; then
@@ -270,7 +315,7 @@ fi
 
 # --- Test 10: Basic auth token swap (git-style) ---
 info "test 10: Basic auth header with kf_ token"
-BASIC_TOKEN=$(curl -sf -X POST http://localhost:10212/tokens \
+BASIC_TOKEN=$(curl -sf -X POST http://localhost:$API_PORT/tokens \
     -d "{\"credential\":\"$CRED\",\"destinations\":[\"api.anthropic.com\"],\"ttl_seconds\":60}" | \
     python3 -c "import sys,json; print(json.load(sys.stdin)['token'])")
 
@@ -278,7 +323,7 @@ BASIC_TOKEN=$(curl -sf -X POST http://localhost:10212/tokens \
 BASIC_AUTH=$(echo -n "x-access-token:$BASIC_TOKEN" | base64)
 
 RESPONSE=$(curl -s -w '\n%{http_code}' \
-    --proxy http://127.0.0.1:10210 \
+    --proxy http://127.0.0.1:$PROXY_PORT \
     --cacert "$CA_CERT" \
     https://api.anthropic.com/v1/messages \
     -H "Content-Type: application/json" \
@@ -298,14 +343,14 @@ fi
 
 # --- Test 11: Per-token rate limiting ---
 info "test 11: per-token rate limit (2 req/60s)"
-RATE_TOKEN=$(curl -sf -X POST http://localhost:10212/tokens \
+RATE_TOKEN=$(curl -sf -X POST http://localhost:$API_PORT/tokens \
     -d "{\"credential\":\"$CRED\",\"destinations\":[\"api.anthropic.com\"],\"ttl_seconds\":60,\"rate_limit\":2,\"rate_window_seconds\":60}" | \
     python3 -c "import sys,json; print(json.load(sys.stdin)['token'])")
 
 # First two requests should succeed (200 or 401 from upstream)
 for i in 1 2; do
     STATUS=$(curl -s -o /dev/null -w '%{http_code}' \
-        --proxy http://127.0.0.1:10210 \
+        --proxy http://127.0.0.1:$PROXY_PORT \
         --cacert "$CA_CERT" \
         https://api.anthropic.com/v1/messages \
         -H "Content-Type: application/json" \
@@ -320,7 +365,7 @@ done
 
 # Third request should be rate-limited → 429
 STATUS=$(curl -s -o /dev/null -w '%{http_code}' \
-    --proxy http://127.0.0.1:10210 \
+    --proxy http://127.0.0.1:$PROXY_PORT \
     --cacert "$CA_CERT" \
     https://api.anthropic.com/v1/messages \
     -H "Content-Type: application/json" \
@@ -337,9 +382,13 @@ fi
 echo ""
 echo "========================================="
 if [ "$FAILURES" -eq 0 ]; then
-    echo -e " ${GREEN}All tests passed${NC}"
+    if [ "$SKIPPED" -eq 0 ]; then
+        echo -e " ${GREEN}All tests passed${NC}"
+    else
+        echo -e " ${GREEN}All tests passed${NC} ($SKIPPED skipped)"
+    fi
 else
-    echo -e " ${RED}$FAILURES test(s) failed${NC}"
+    echo -e " ${RED}$FAILURES test(s) failed${NC} ($SKIPPED skipped)"
 fi
 echo "========================================="
 exit "$FAILURES"
