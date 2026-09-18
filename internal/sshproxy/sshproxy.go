@@ -289,6 +289,21 @@ func (s *Server) bridgeSSHSession(token *tokenstore.Token, tokenValue string, ch
 		sendExitStatus(channel, 1)
 		return
 	}
+	if token.MaxRequests > 0 && !s.store.CheckBudget(tokenValue) {
+		s.audit.Log(audit.Entry{
+			Event:      audit.EventSSHDeny,
+			TokenID:    token.ID,
+			AgentID:    token.AgentID,
+			TaskID:     token.TaskID,
+			SSHCommand: command,
+			DenyRule:   "request_budget",
+			DenyReason: fmt.Sprintf("token request budget exceeded: %d", token.MaxRequests),
+		})
+		span.SetStatus(codes.Error, "request_budget")
+		_, _ = fmt.Fprintf(channel.Stderr(), "request budget exceeded\r\n")
+		sendExitStatus(channel, 1)
+		return
+	}
 
 	// Determine upstream host from allowed destinations
 	if len(token.AllowedDestinations) == 0 {

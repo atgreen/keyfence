@@ -40,6 +40,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -276,6 +277,10 @@ func main() {
 	// Token management API
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /tokens", requireControlAuth(controlKey, peerAllow, handleIssueToken(store, creds, certs, sshKeys, auditLog, named)))
+	// Possession of a valid parent capability authorizes attenuation. The
+	// endpoint does not accept the control API key in its place: a caller has to
+	// prove it holds the authority it wants to delegate.
+	mux.HandleFunc("POST /tokens/attenuate", handleAttenuateToken(store, pol, auditLog))
 	mux.HandleFunc("GET /tokens", requireControlAuth(controlKey, peerAllow, handleListTokens(store)))
 	mux.HandleFunc("DELETE /tokens/{token}", requireControlAuth(controlKey, peerAllow, handleRevokeToken(store, auditLog, reaper)))
 	mux.HandleFunc("DELETE /tasks/{task_id}/tokens", requireControlAuth(controlKey, peerAllow, handleRevokeByTask(store, auditLog)))
@@ -433,6 +438,7 @@ type issueRequest struct {
 	TaskID            string                    `json:"task_id"`
 	RateLimit         int                       `json:"rate_limit"`
 	RateWindowSeconds int                       `json:"rate_window_seconds"`
+	MaxRequests       int                       `json:"max_requests"`
 	ClientCert        string                    `json:"client_cert"`
 	ClientKey         string                    `json:"client_key"`
 	ClientCertHeader  string                    `json:"client_cert_header"`
@@ -449,6 +455,20 @@ type issueResponse struct {
 	Policy       string   `json:"policy,omitempty"`
 	AgentID      string   `json:"agent_id,omitempty"`
 	TaskID       string   `json:"task_id,omitempty"`
+	ParentID     string   `json:"parent_id,omitempty"`
+	RootID       string   `json:"root_id,omitempty"`
+}
+
+type attenuateRequest struct {
+	Destinations      []string `json:"destinations"`
+	TTLSeconds        *int     `json:"ttl_seconds"`
+	Label             string   `json:"label"`
+	AllowedMethods    []string `json:"allowed_methods"`
+	AllowedPaths      []string `json:"allowed_paths"`
+	DeniedPaths       []string `json:"denied_paths"`
+	RateLimit         *int     `json:"rate_limit"`
+	RateWindowSeconds *int     `json:"rate_window_seconds"`
+	MaxRequests       *int     `json:"max_requests"`
 }
 
 func handleIssueToken(store *tokenstore.Store, creds credstore.Backend, certStore *credstore.CertStore, sshKeyStore *credstore.SSHKeyStore, auditLog *audit.Logger, named *credstore.NamedStore) http.HandlerFunc {
@@ -545,6 +565,7 @@ func handleIssueToken(store *tokenstore.Store, creds credstore.Backend, certStor
 			TaskID:              req.TaskID,
 			RateLimit:           req.RateLimit,
 			RateWindow:          rateWindow,
+			MaxRequests:         req.MaxRequests,
 			ClientCertID:        clientCertID,
 			ClientCertHeader:    req.ClientCertHeader,
 			SSHKeyID:            sshKeyID,
@@ -578,6 +599,98 @@ func handleIssueToken(store *tokenstore.Store, creds credstore.Backend, certStor
 	}
 }
 
+func handleAttenuateToken(store *tokenstore.Store, policies *policy.Engine, auditLog *audit.Logger) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		const bearer = "Bearer "
+		authorization := r.Header.Get("Authorization")
+		if !strings.HasPrefix(authorization, bearer) {
+			http.Error(w, `{"error":"unauthorized: a parent bearer token is required"}`, http.StatusUnauthorized)
+			return
+		}
+		parentValue := strings.TrimPrefix(authorization, bearer)
+		parent := store.Resolve(parentValue)
+		if parent == nil {
+			http.Error(w, `{"error":"unauthorized: parent token is invalid or expired"}`, http.StatusUnauthorized)
+			return
+		}
+
+		var req attenuateRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, fmt.Sprintf(`{"error":"invalid json: %s"}`, err), http.StatusBadRequest)
+			return
+		}
+		if req.TTLSeconds != nil && *req.TTLSeconds <= 0 {
+			http.Error(w, `{"error":"ttl_seconds must be positive"}`, http.StatusBadRequest)
+			return
+		}
+		if parentPolicy := policies.Get(parent.PolicyName); parentPolicy != nil {
+			if req.AllowedMethods != nil && !tokenstore.MethodsAreSubset(parentPolicy.AllowedMethods, req.AllowedMethods) {
+				http.Error(w, `{"error":"child methods are not a subset of the parent policy"}`, http.StatusBadRequest)
+				return
+			}
+			if req.AllowedPaths != nil && !tokenstore.PatternsAreSubset(parentPolicy.AllowedPaths, req.AllowedPaths) {
+				http.Error(w, `{"error":"child paths are not a subset of the parent policy"}`, http.StatusBadRequest)
+				return
+			}
+		}
+
+		var ttl time.Duration
+		if req.TTLSeconds != nil {
+			ttl = time.Duration(*req.TTLSeconds) * time.Second
+		}
+		var rateWindow *time.Duration
+		if req.RateWindowSeconds != nil {
+			window := time.Duration(*req.RateWindowSeconds) * time.Second
+			rateWindow = &window
+		}
+		child, err := store.IssueChild(parentValue, tokenstore.ChildParams{
+			AllowedDestinations: req.Destinations,
+			TTL:                 ttl,
+			Label:               req.Label,
+			AllowedMethods:      req.AllowedMethods,
+			AllowedPaths:        req.AllowedPaths,
+			DeniedPaths:         req.DeniedPaths,
+			RateLimit:           req.RateLimit,
+			RateWindow:          rateWindow,
+			MaxRequests:         req.MaxRequests,
+		})
+		if err != nil {
+			var attenuationError *tokenstore.AttenuationError
+			if errors.As(err, &attenuationError) {
+				http.Error(w, fmt.Sprintf(`{"error":"%s"}`, attenuationError), http.StatusBadRequest)
+				return
+			}
+			http.Error(w, fmt.Sprintf(`{"error":"issuing child token: %s"}`, err), http.StatusInternalServerError)
+			return
+		}
+
+		auditLog.Log(audit.Entry{
+			Event:         audit.EventDelegate,
+			TokenID:       child.ID,
+			ParentTokenID: child.ParentID,
+			RootTokenID:   child.RootID,
+			AgentID:       child.AgentID,
+			TaskID:        child.TaskID,
+			Label:         child.Label,
+			Policy:        child.PolicyName,
+			TTL:           time.Until(child.ExpiresAt).Round(time.Second).String(),
+		})
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(issueResponse{
+			Token:        child.Value,
+			ExpiresAt:    child.ExpiresAt.Format(time.RFC3339),
+			Destinations: child.AllowedDestinations,
+			Label:        child.Label,
+			Policy:       child.PolicyName,
+			AgentID:      child.AgentID,
+			TaskID:       child.TaskID,
+			ParentID:     child.ParentID,
+			RootID:       child.RootID,
+		})
+	}
+}
+
 func handleListTokens(store *tokenstore.Store) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		tokens := store.List()
@@ -590,18 +703,22 @@ func handleListTokens(store *tokenstore.Store) http.HandlerFunc {
 			Policy       string   `json:"policy,omitempty"`
 			AgentID      string   `json:"agent_id,omitempty"`
 			TaskID       string   `json:"task_id,omitempty"`
+			ParentID     string   `json:"parent_id,omitempty"`
+			RootID       string   `json:"root_id,omitempty"`
 		}
 		result := make([]entry, 0, len(tokens))
 		for _, t := range tokens {
 			result = append(result, entry{
 				ID:           t.ID,
 				ExpiresAt:    t.ExpiresAt.Format(time.RFC3339),
-				Valid:        t.IsValid(),
+				Valid:        store.Resolve(t.Value) != nil,
 				Destinations: t.AllowedDestinations,
 				Label:        t.Label,
 				Policy:       t.PolicyName,
 				AgentID:      t.AgentID,
 				TaskID:       t.TaskID,
+				ParentID:     t.ParentID,
+				RootID:       t.RootID,
 			})
 		}
 		w.Header().Set("Content-Type", "application/json")

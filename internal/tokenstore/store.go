@@ -22,6 +22,8 @@ import (
 type Token struct {
 	ID                  string
 	Value               string                 // kf_<random>
+	ParentID            string                 // public ID of the token this one was derived from
+	RootID              string                 // public ID at the root of the delegation chain
 	CredentialID        string                 // reference into credential backend
 	CredentialRef       string                 // name of an operator-registered credential
 	AllowedDestinations []string               // hosts or host/path patterns this token can be used against
@@ -30,6 +32,10 @@ type Token struct {
 	TaskID              string                 // orchestrator-assigned task scope
 	RateLimit           int                    // max requests per window; 0 = unlimited
 	RateWindow          time.Duration          // window duration
+	MaxRequests         int                    // max requests over the token's life; 0 = unlimited
+	AllowedMethods      []string               // optional per-token HTTP method restriction
+	AllowedPaths        []string               // optional per-token HTTP path restriction
+	DeniedPaths         []string               // per-token HTTP paths denied in addition to its policy
 	ClientCertID        string                 // reference to cert+key in cert store
 	ClientCertHeader    string                 // header to inject cert PEM into (optional)
 	SSHKeyID            string                 // reference to SSH key in SSH key store
@@ -45,6 +51,7 @@ type Token struct {
 	// rate tracking (internal)
 	rateCount int
 	rateStart time.Time
+	requests  int
 }
 
 func (t *Token) IsValid() bool {
@@ -121,19 +128,123 @@ func matchPath(pattern, reqPath string) bool {
 	return matched
 }
 
+// DestinationsAreSubset conservatively proves that every child destination is
+// contained by a parent destination. Patterns it cannot prove safe are accepted
+// only when identical; attenuation may reject a useful glob, but never widens a
+// capability by guessing about one.
+func DestinationsAreSubset(parent, child []string) bool {
+	if len(parent) == 0 {
+		return false
+	}
+	for _, childDestination := range child {
+		contained := false
+		for _, parentDestination := range parent {
+			if destinationContains(parentDestination, childDestination) {
+				contained = true
+				break
+			}
+		}
+		if !contained {
+			return false
+		}
+	}
+	return true
+}
+
+func destinationContains(parent, child string) bool {
+	if parent == AnyDestination || parent == child {
+		return true
+	}
+	if child == AnyDestination {
+		return false
+	}
+	parentHost, parentPath := splitDestination(parent)
+	childHost, childPath := splitDestination(child)
+	if parentHost != childHost {
+		return false
+	}
+	if parentPath == "" {
+		return true
+	}
+	if childPath == "" {
+		return false
+	}
+	return patternContains(parentPath, childPath)
+}
+
+// PatternsAreSubset applies the same conservative containment rules to HTTP
+// path patterns. An empty parent list means unrestricted and contains any
+// non-empty child restriction.
+func PatternsAreSubset(parent, child []string) bool {
+	if len(parent) == 0 {
+		return true
+	}
+	for _, childPattern := range child {
+		contained := false
+		for _, parentPattern := range parent {
+			if patternContains(parentPattern, childPattern) {
+				contained = true
+				break
+			}
+		}
+		if !contained {
+			return false
+		}
+	}
+	return true
+}
+
+func patternContains(parent, child string) bool {
+	if parent == child {
+		return true
+	}
+	if !strings.HasSuffix(parent, "/*") {
+		return false
+	}
+	prefix := strings.TrimSuffix(parent, "/*")
+	return child == prefix || strings.HasPrefix(child, prefix+"/")
+}
+
+// MethodsAreSubset compares HTTP method sets case-insensitively. An empty
+// parent set means unrestricted.
+func MethodsAreSubset(parent, child []string) bool {
+	return stringsAreSubsetFold(parent, child)
+}
+
+func stringsAreSubsetFold(parent, child []string) bool {
+	if len(parent) == 0 {
+		return true
+	}
+	for _, candidate := range child {
+		found := false
+		for _, allowed := range parent {
+			if strings.EqualFold(candidate, allowed) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
+}
+
 // ResponseRule is a Lua script evaluated against JSON responses.
 type ResponseRule struct {
 	Script string `json:"script"`
 }
 
 type Store struct {
-	mu     sync.RWMutex
-	tokens map[string]*Token // keyed by token value (kf_...)
+	mu         sync.RWMutex
+	tokens     map[string]*Token // keyed by token value (kf_...)
+	tokensByID map[string]*Token // keyed by public, non-secret token ID
 }
 
 func New() *Store {
 	return &Store{
-		tokens: make(map[string]*Token),
+		tokens:     make(map[string]*Token),
+		tokensByID: make(map[string]*Token),
 	}
 }
 
@@ -149,6 +260,10 @@ type IssueParams struct {
 	TaskID              string
 	RateLimit           int
 	RateWindow          time.Duration
+	MaxRequests         int
+	AllowedMethods      []string
+	AllowedPaths        []string
+	DeniedPaths         []string
 	ClientCertID        string
 	ClientCertHeader    string
 	SSHKeyID            string
@@ -162,15 +277,27 @@ func tokenID(value string) string {
 }
 
 func (s *Store) Issue(p IssueParams) (*Token, error) {
+	token, err := newToken(p, time.Now(), "", "")
+	if err != nil {
+		return nil, err
+	}
+
+	s.mu.Lock()
+	s.tokens[token.Value] = token
+	s.tokensByID[token.ID] = token
+	s.mu.Unlock()
+
+	return token, nil
+}
+
+func newToken(p IssueParams, now time.Time, parentID, rootID string) (*Token, error) {
 	random := make([]byte, 16)
 	if _, err := rand.Read(random); err != nil {
 		return nil, fmt.Errorf("generating random bytes: %w", err)
 	}
 
 	value := "kf_" + hex.EncodeToString(random)
-	now := time.Now()
-
-	token := &Token{
+	return &Token{
 		// Derived from the value by hashing rather than taken from it. The id was
 		// the first eight of the sixteen random bytes, so every audit entry
 		// naming a token handed out half of it -- and the audit trail is the one
@@ -179,28 +306,168 @@ func (s *Store) Issue(p IssueParams) (*Token, error) {
 		// holding it and tells anyone else nothing.
 		ID:                  tokenID(value),
 		Value:               value,
+		ParentID:            parentID,
+		RootID:              rootID,
 		CredentialID:        p.CredentialID,
 		CredentialRef:       p.CredentialRef,
-		AllowedDestinations: p.AllowedDestinations,
+		AllowedDestinations: append([]string(nil), p.AllowedDestinations...),
 		PolicyName:          p.PolicyName,
 		AgentID:             p.AgentID,
 		TaskID:              p.TaskID,
 		RateLimit:           p.RateLimit,
 		RateWindow:          p.RateWindow,
+		MaxRequests:         p.MaxRequests,
+		AllowedMethods:      append([]string(nil), p.AllowedMethods...),
+		AllowedPaths:        append([]string(nil), p.AllowedPaths...),
+		DeniedPaths:         append([]string(nil), p.DeniedPaths...),
 		ClientCertID:        p.ClientCertID,
 		ClientCertHeader:    p.ClientCertHeader,
 		SSHKeyID:            p.SSHKeyID,
-		ResponseRules:       p.ResponseRules,
+		ResponseRules:       append([]ResponseRule(nil), p.ResponseRules...),
 		RuleState:           make(map[string]interface{}),
 		CreatedAt:           now,
 		ExpiresAt:           now.Add(p.TTL),
 		Label:               p.Label,
+	}, nil
+}
+
+// ChildParams contains only fields a delegated token is allowed to narrow.
+// Nil slices and pointers inherit the corresponding parent restriction.
+type ChildParams struct {
+	AllowedDestinations []string
+	TTL                 time.Duration
+	Label               string
+	AllowedMethods      []string
+	AllowedPaths        []string
+	DeniedPaths         []string
+	RateLimit           *int
+	RateWindow          *time.Duration
+	MaxRequests         *int
+}
+
+// AttenuationError reports a requested child restriction that would widen or
+// otherwise fail to meaningfully describe a child capability.
+type AttenuationError struct {
+	Reason string
+}
+
+func (e *AttenuationError) Error() string { return e.Reason }
+
+// IssueChild derives a token that refers to the same credential material as a
+// valid parent but can only reduce its authority.
+func (s *Store) IssueChild(parentValue string, child ChildParams) (*Token, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	parent := s.tokens[parentValue]
+	if parent == nil || !s.isValidLocked(parent) {
+		return nil, &AttenuationError{Reason: "parent token is invalid or expired"}
 	}
 
-	s.mu.Lock()
-	s.tokens[value] = token
-	s.mu.Unlock()
+	destinations := child.AllowedDestinations
+	if destinations == nil {
+		destinations = parent.AllowedDestinations
+	}
+	if len(destinations) == 0 {
+		return nil, &AttenuationError{Reason: "a child token must have at least one destination"}
+	}
+	if !DestinationsAreSubset(parent.AllowedDestinations, destinations) {
+		return nil, &AttenuationError{Reason: "child destinations are not a subset of the parent"}
+	}
 
+	methods := child.AllowedMethods
+	if methods == nil {
+		methods = parent.AllowedMethods
+	} else if len(methods) == 0 {
+		return nil, &AttenuationError{Reason: "allowed_methods cannot be empty"}
+	}
+	if !stringsAreSubsetFold(parent.AllowedMethods, methods) {
+		return nil, &AttenuationError{Reason: "child methods are not a subset of the parent"}
+	}
+
+	paths := child.AllowedPaths
+	if paths == nil {
+		paths = parent.AllowedPaths
+	} else if len(paths) == 0 {
+		return nil, &AttenuationError{Reason: "allowed_paths cannot be empty"}
+	}
+	if !PatternsAreSubset(parent.AllowedPaths, paths) {
+		return nil, &AttenuationError{Reason: "child paths are not a subset of the parent"}
+	}
+
+	rateLimit := parent.RateLimit
+	rateWindow := parent.RateWindow
+	if child.RateLimit == nil && child.RateWindow != nil {
+		return nil, &AttenuationError{Reason: "rate_window_seconds requires rate_limit"}
+	}
+	if child.RateLimit != nil {
+		if *child.RateLimit <= 0 {
+			return nil, &AttenuationError{Reason: "rate_limit must be positive"}
+		}
+		if child.RateWindow != nil {
+			rateWindow = *child.RateWindow
+		} else if parent.RateLimit == 0 {
+			return nil, &AttenuationError{Reason: "rate_window_seconds is required when the parent has no rate limit"}
+		}
+		if rateWindow <= 0 {
+			return nil, &AttenuationError{Reason: "rate_window_seconds must be positive"}
+		}
+		if parent.RateLimit > 0 && (*child.RateLimit > parent.RateLimit || rateWindow != parent.RateWindow) {
+			return nil, &AttenuationError{Reason: "child rate must use the parent's window and cannot exceed its limit"}
+		}
+		rateLimit = *child.RateLimit
+	}
+
+	maxRequests := parent.MaxRequests
+	if child.MaxRequests != nil {
+		if *child.MaxRequests <= 0 {
+			return nil, &AttenuationError{Reason: "max_requests must be positive"}
+		}
+		if parent.MaxRequests > 0 && *child.MaxRequests > parent.MaxRequests {
+			return nil, &AttenuationError{Reason: "child request budget cannot exceed the parent"}
+		}
+		maxRequests = *child.MaxRequests
+	}
+
+	now := time.Now()
+	expiresAt := parent.ExpiresAt
+	if child.TTL > 0 {
+		expiresAt = now.Add(child.TTL)
+		if expiresAt.After(parent.ExpiresAt) {
+			return nil, &AttenuationError{Reason: "child TTL cannot outlive the parent"}
+		}
+	}
+
+	rootID := parent.RootID
+	if rootID == "" {
+		rootID = parent.ID
+	}
+	params := IssueParams{
+		CredentialID:        parent.CredentialID,
+		CredentialRef:       parent.CredentialRef,
+		AllowedDestinations: append([]string(nil), destinations...),
+		TTL:                 expiresAt.Sub(now),
+		Label:               child.Label,
+		PolicyName:          parent.PolicyName,
+		AgentID:             parent.AgentID,
+		TaskID:              parent.TaskID,
+		RateLimit:           rateLimit,
+		RateWindow:          rateWindow,
+		MaxRequests:         maxRequests,
+		AllowedMethods:      append([]string(nil), methods...),
+		AllowedPaths:        append([]string(nil), paths...),
+		DeniedPaths:         append(append([]string(nil), parent.DeniedPaths...), child.DeniedPaths...),
+		ClientCertID:        parent.ClientCertID,
+		ClientCertHeader:    parent.ClientCertHeader,
+		SSHKeyID:            parent.SSHKeyID,
+		ResponseRules:       append([]ResponseRule(nil), parent.ResponseRules...),
+	}
+	token, err := newToken(params, now, parent.ID, rootID)
+	if err != nil {
+		return nil, err
+	}
+	s.tokens[token.Value] = token
+	s.tokensByID[token.ID] = token
 	return token, nil
 }
 
@@ -221,10 +488,28 @@ func (s *Store) Resolve(tokenValue string) *Token {
 	if !ok {
 		return nil
 	}
-	if !t.IsValid() {
+	if !s.isValidLocked(t) {
 		return nil
 	}
 	return t
+}
+
+func (s *Store) isValidLocked(token *Token) bool {
+	seen := make(map[string]struct{})
+	for token != nil {
+		if !token.IsValid() {
+			return false
+		}
+		if token.ParentID == "" {
+			return true
+		}
+		if _, duplicate := seen[token.ID]; duplicate {
+			return false
+		}
+		seen[token.ID] = struct{}{}
+		token = s.tokensByID[token.ParentID]
+	}
+	return false
 }
 
 func (s *Store) Revoke(tokenValue string) bool {
@@ -236,7 +521,23 @@ func (s *Store) Revoke(tokenValue string) bool {
 		return false
 	}
 	t.Revoked = true
+	s.revokeDescendantsLocked(t.ID)
 	return true
+}
+
+func (s *Store) revokeDescendantsLocked(parentID string) {
+	parents := []string{parentID}
+	for len(parents) > 0 {
+		current := parents[0]
+		parents = parents[1:]
+		for _, candidate := range s.tokens {
+			if candidate.ParentID != current {
+				continue
+			}
+			candidate.Revoked = true
+			parents = append(parents, candidate.ID)
+		}
+	}
 }
 
 // RevokeByTaskID revokes all tokens for a given task. Returns the count revoked.
@@ -249,6 +550,11 @@ func (s *Store) RevokeByTaskID(taskID string) int {
 		if t.TaskID == taskID && !t.Revoked {
 			t.Revoked = true
 			count++
+		}
+	}
+	for _, t := range s.tokens {
+		if t.TaskID == taskID {
+			s.revokeDescendantsLocked(t.ID)
 		}
 	}
 	return count
@@ -272,7 +578,7 @@ func (s *Store) CountByCredentialID(credID string) int {
 
 	count := 0
 	for _, t := range s.tokens {
-		if t.IsValid() && t.CredentialID == credID {
+		if s.isValidLocked(t) && t.CredentialID == credID {
 			count++
 		}
 	}
@@ -287,22 +593,50 @@ func (s *Store) CheckRate(tokenValue string) bool {
 	defer s.mu.Unlock()
 
 	t, ok := s.tokens[tokenValue]
-	if !ok {
+	if !ok || !s.isValidLocked(t) {
 		return false
 	}
-	if t.RateLimit <= 0 {
-		return true
-	}
-
 	now := time.Now()
-	if t.rateStart.IsZero() || now.Sub(t.rateStart) >= t.RateWindow {
-		t.rateCount = 1
-		t.rateStart = now
-		return true
+	allowed := true
+	for current := t; current != nil; current = s.tokensByID[current.ParentID] {
+		if current.RateLimit <= 0 {
+			continue
+		}
+		if current.rateStart.IsZero() || now.Sub(current.rateStart) >= current.RateWindow {
+			current.rateCount = 1
+			current.rateStart = now
+			continue
+		}
+		current.rateCount++
+		if current.rateCount > current.RateLimit {
+			allowed = false
+		}
 	}
+	return allowed
+}
 
-	t.rateCount++
-	return t.rateCount <= t.RateLimit
+// CheckBudget consumes one request from a token and every ancestor budget.
+// Charging the whole chain prevents deriving children from multiplying the
+// number of requests their parent capability authorized.
+func (s *Store) CheckBudget(tokenValue string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	t, ok := s.tokens[tokenValue]
+	if !ok || !s.isValidLocked(t) {
+		return false
+	}
+	allowed := true
+	for current := t; current != nil; current = s.tokensByID[current.ParentID] {
+		if current.MaxRequests <= 0 {
+			continue
+		}
+		current.requests++
+		if current.requests > current.MaxRequests {
+			allowed = false
+		}
+	}
+	return allowed
 }
 
 // Cleanup removes expired and revoked tokens and answers what it removed, so
@@ -312,9 +646,14 @@ func (s *Store) Cleanup() []*Token {
 	defer s.mu.Unlock()
 
 	var removed []*Token
+	invalid := make(map[string]bool)
+	for value, t := range s.tokens {
+		invalid[value] = !s.isValidLocked(t)
+	}
 	for k, t := range s.tokens {
-		if t.Revoked || time.Now().After(t.ExpiresAt) {
+		if invalid[k] {
 			delete(s.tokens, k)
+			delete(s.tokensByID, t.ID)
 			removed = append(removed, t)
 		}
 	}
@@ -328,7 +667,7 @@ func (s *Store) CountByClientCertID(certID string) int {
 
 	count := 0
 	for _, t := range s.tokens {
-		if t.IsValid() && t.ClientCertID == certID {
+		if s.isValidLocked(t) && t.ClientCertID == certID {
 			count++
 		}
 	}
@@ -342,7 +681,7 @@ func (s *Store) CountBySSHKeyID(keyID string) int {
 
 	count := 0
 	for _, t := range s.tokens {
-		if t.IsValid() && t.SSHKeyID == keyID {
+		if s.isValidLocked(t) && t.SSHKeyID == keyID {
 			count++
 		}
 	}

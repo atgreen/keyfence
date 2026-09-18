@@ -225,7 +225,8 @@ and offers Basic only in answer to a challenge, so without the header a clone
 through the proxy failed with "Authentication failed" having never sent the token
 it was holding.
 
-All TCP control API endpoints except `/health` require the key as a Bearer token:
+All TCP control API endpoints except `/health` and the parent-authorized
+`POST /tokens/attenuate` require the control key as a Bearer token:
 
 ```bash
 curl -H "Authorization: Bearer $KEYFENCE_API_KEY" \
@@ -323,6 +324,36 @@ Response:
   "policy": "strict"
 }
 ```
+
+### Delegate a narrower token
+
+A holder can derive a child capability without possessing or resubmitting the
+credential behind it. The parent token itself authorizes this endpoint:
+
+```bash
+curl -H "Authorization: Bearer $PARENT_TOKEN" \
+  -X POST http://localhost:10212/tokens/attenuate \
+  -d '{
+    "destinations": ["api.anthropic.com/v1/models"],
+    "allowed_methods": ["GET"],
+    "allowed_paths": ["/v1/models"],
+    "ttl_seconds": 60,
+    "rate_limit": 5,
+    "rate_window_seconds": 60,
+    "max_requests": 10,
+    "label": "model discovery"
+  }'
+```
+
+Omitted fields inherit the parent. Supplied destinations, methods, paths, rate,
+request budget, and TTL must be equal to or narrower than the parent's effective
+authority. A child inherits the parent's named policy and credential references;
+credential bytes are never copied into the request. Parent and child usage both
+consume ancestor rate and request budgets, so delegation cannot multiply a
+quota. Revoking or expiring any ancestor invalidates every descendant.
+
+The response includes public `parent_id` and `root_id` values. Delegation audit
+events record the same lineage without recording any `kf_` token value.
 
 ### Credentials KeyFence holds by name
 

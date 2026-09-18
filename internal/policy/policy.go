@@ -112,6 +112,24 @@ func (e *Engine) Check(policyName string, tokenID string, req *http.Request) *De
 		}
 	}
 
+	if deny := p.CheckRequest(req); deny != nil {
+		return deny
+	}
+	if deny := e.checkRateLimit(p, tokenID); deny != nil {
+		return deny
+	}
+	if deny := e.checkBudget(p, tokenID); deny != nil {
+		return deny
+	}
+
+	return nil
+}
+
+// CheckRequest evaluates the stateless restrictions in a policy. It is also
+// used for restrictions attached directly to an attenuated token; rate and
+// budget accounting for those lives in tokenstore so the whole ancestor chain
+// can be charged together.
+func (p *Policy) CheckRequest(req *http.Request) *Deny {
 	if deny := p.checkMethod(req.Method); deny != nil {
 		return deny
 	}
@@ -124,13 +142,6 @@ func (e *Engine) Check(policyName string, tokenID string, req *http.Request) *De
 	if deny := p.checkBodySize(req); deny != nil {
 		return deny
 	}
-	if deny := e.checkRateLimit(p, tokenID); deny != nil {
-		return deny
-	}
-	if deny := e.checkBudget(p, tokenID); deny != nil {
-		return deny
-	}
-
 	return nil
 }
 

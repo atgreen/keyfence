@@ -477,6 +477,22 @@ func (p *Proxy) processRequest(ctx context.Context, clientConn net.Conn, req *ht
 		writeError(clientConn, 429, fmt.Sprintf("rate limit exceeded: %d requests per %s", token.RateLimit, token.RateWindow))
 		return false
 	}
+	if token.MaxRequests > 0 && !p.store.CheckBudget(tokenValue) {
+		p.audit.Log(audit.Entry{
+			Event:       audit.EventDeny,
+			TokenID:     token.ID,
+			AgentID:     token.AgentID,
+			TaskID:      token.TaskID,
+			Destination: targetHost,
+			Method:      req.Method,
+			Path:        req.URL.Path,
+			DenyRule:    "request_budget",
+			DenyReason:  fmt.Sprintf("token request budget exceeded: %d", token.MaxRequests),
+		})
+		span.SetStatus(codes.Error, "request_budget")
+		writeError(clientConn, 429, fmt.Sprintf("request budget exceeded: %d requests", token.MaxRequests))
+		return false
+	}
 
 	// Check destination
 	if !token.IsDestinationAllowed(targetHost, req.URL.Path) {
@@ -498,7 +514,11 @@ func (p *Proxy) processRequest(ctx context.Context, clientConn net.Conn, req *ht
 
 	// Policy check
 	if p.policy != nil {
-		if deny := p.policy.Check(token.PolicyName, token.ID, req); deny != nil {
+		budgetID := token.RootID
+		if budgetID == "" {
+			budgetID = token.ID
+		}
+		if deny := p.policy.Check(token.PolicyName, budgetID, req); deny != nil {
 			p.audit.Log(audit.Entry{
 				Event:       audit.EventDeny,
 				TokenID:     token.ID,
@@ -515,6 +535,28 @@ func (p *Proxy) processRequest(ctx context.Context, clientConn net.Conn, req *ht
 			writeError(clientConn, 403, deny.Message)
 			return false
 		}
+	}
+	direct := &policy.Policy{
+		AllowedMethods: token.AllowedMethods,
+		AllowedPaths:   token.AllowedPaths,
+		DeniedPaths:    token.DeniedPaths,
+	}
+	if deny := direct.CheckRequest(req); deny != nil {
+		p.audit.Log(audit.Entry{
+			Event:       audit.EventDeny,
+			TokenID:     token.ID,
+			AgentID:     token.AgentID,
+			TaskID:      token.TaskID,
+			Destination: targetHost,
+			Method:      req.Method,
+			Path:        req.URL.Path,
+			Policy:      token.PolicyName,
+			DenyRule:    "token_" + deny.Rule,
+			DenyReason:  deny.Message,
+		})
+		span.SetStatus(codes.Error, "token_policy_denied")
+		writeError(clientConn, 403, deny.Message)
+		return false
 	}
 
 	// Fetch and swap header credential (if token has one)
