@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "embedded",
+  "dolt_database": "keyfence",
+  "project_id": "d5825b84-becd-4752-83c2-eb920f1f9294"
+}
