@@ -231,7 +231,7 @@ REVOKE_TOKEN=$(curl -sf -X POST -H "$AUTH" http://localhost:$API_PORT/tokens \
     -d "{\"credential\":\"$CRED\",\"destinations\":[\"api.anthropic.com\"],\"ttl_seconds\":300}" | \
     python3 -c "import sys,json; print(json.load(sys.stdin)['token'])")
 
-curl -sf -X DELETE "-H "$AUTH" http://localhost:$API_PORT/tokens/$REVOKE_TOKEN" > /dev/null
+curl -sf -X DELETE -H "$AUTH" "http://localhost:$API_PORT/tokens/$REVOKE_TOKEN" > /dev/null
 
 STATUS=$(curl -s -o /dev/null -w '%{http_code}' \
     --proxy http://127.0.0.1:$PROXY_PORT \
