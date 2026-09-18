@@ -1,0 +1,18 @@
+# Socket activation for KeyFence: the peer-authenticated local control API.
+#
+# SPDX-License-Identifier: MIT
+
+[Unit]
+Description=KeyFence Unix control socket
+Documentation=https://github.com/atgreen/keyfence
+
+[Socket]
+ListenStream=%t/keyfence/control.sock
+FileDescriptorName=control
+SocketMode=0660
+DirectoryMode=0700
+RemoveOnStop=yes
+Service=keyfence.service
+
+[Install]
+WantedBy=sockets.target

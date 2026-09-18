@@ -81,6 +81,10 @@ func main() {
 	apiKey := flag.String("api-key", "", "require this Bearer token on all control API requests")
 	apiKeyFile := flag.String("api-key-file", "", "read the control API key from this file, so it is not in argv")
 	insecureAPI := flag.Bool("insecure-api", false, "run the control API with no key at all (it can issue and revoke credentials)")
+	var allowedUIDs idAllowlist
+	var allowedGIDs idAllowlist
+	flag.Var(&allowedUIDs, "api-allow-uid", "numeric UID allowed to use a Unix-socket control API (repeatable)")
+	flag.Var(&allowedGIDs, "api-allow-group", "numeric primary GID allowed to use a Unix-socket control API (repeatable)")
 	noReuse := flag.Bool("no-reuse-connections", false, "close each tunnel after one request instead of keeping it for the next")
 	useKeyring := flag.Bool("keyring", false, "also resolve named credentials from the OS keyring (service=keyfence credential=<name>), which keeps them off disk in plaintext")
 	passthrough := flag.String("passthrough", "", "comma-separated hosts reachable through the proxy without a token, with *.example.com matching subdomains (nothing is injected for them)")
@@ -88,20 +92,6 @@ func main() {
 	knownHosts := flag.String("ssh-known-hosts", "", "known_hosts file used to authenticate upstream SSH hosts (default <data-dir>/ssh/known_hosts)")
 	insecureHostKeys := flag.Bool("ssh-insecure-host-keys", false, "accept any upstream SSH host key (the bastion's key can then be used against an impostor)")
 	flag.Parse()
-
-	controlKey, err := resolveAPIKey(*apiKey, *apiKeyFile)
-	if err != nil {
-		log.Fatalf("api key: %v", err)
-	}
-	if controlKey == "" && !*insecureAPI {
-		log.Fatalf("refusing to start: the control API issues and revokes credentials, and " +
-			"no key was given.\n" +
-			"  Pass -api-key-file FILE (or -api-key), or -insecure-api if you " +
-			"really mean to leave it open.")
-	}
-	if controlKey == "" {
-		log.Printf("WARNING: -insecure-api given. Any process that can reach %s can issue and revoke tokens.", *apiAddr)
-	}
 
 	// Sockets systemd may have passed in. With socket activation the broker can
 	// be enabled without running: systemd holds the ports and starts this on the
@@ -115,9 +105,46 @@ func main() {
 	proxyListener := activation.Take(activated, "proxy")
 	sshListener := activation.Take(activated, "ssh")
 	apiListener := activation.Take(activated, "api")
+	controlListener := activation.Take(activated, "control")
+	peerAllow := peerAllowlist{uids: allowedUIDs, gids: allowedGIDs}
+	controlKey, err := resolveAPIKey(*apiKey, *apiKeyFile)
+	if err != nil {
+		log.Fatalf("api key: %v", err)
+	}
+	apiHasUnix := false
+	apiHasTCP := false
+	for _, listener := range []net.Listener{apiListener, controlListener} {
+		if listener == nil {
+			continue
+		}
+		if listenerIsUnix(listener, "") {
+			apiHasUnix = true
+		} else {
+			apiHasTCP = true
+		}
+	}
+	if apiListener == nil && controlListener == nil {
+		apiHasUnix = listenerIsUnix(nil, *apiAddr)
+		apiHasTCP = !apiHasUnix
+	}
+	if apiHasUnix && peerAllow.empty() {
+		log.Fatalf("refusing to start: a Unix control API requires at least one -api-allow-uid or -api-allow-group")
+	}
+	if apiHasTCP && controlKey == "" && !*insecureAPI {
+		log.Fatalf("refusing to start: the TCP control API issues and revokes credentials, and " +
+			"no key was given.\n" +
+			"  Pass -api-key-file FILE (or -api-key), or -insecure-api if you " +
+			"really mean to leave it open.")
+	}
+	if apiHasTCP && controlKey == "" {
+		log.Printf("WARNING: -insecure-api given. Any process that can reach %s can issue and revoke tokens.", *apiAddr)
+	}
 	reportedProxy := listeningOn(proxyListener, *proxyAddr)
 	reportedSSH := listeningOn(sshListener, *sshAddr)
 	reportedAPI := listeningOn(apiListener, *apiAddr)
+	if apiListener == nil && controlListener != nil {
+		reportedAPI = controlListener.Addr().String()
+	}
 
 	// Initialize OpenTelemetry (configured via OTEL_* env vars)
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
@@ -248,23 +275,23 @@ func main() {
 
 	// Token management API
 	mux := http.NewServeMux()
-	mux.HandleFunc("POST /tokens", requireAPIKey(controlKey, handleIssueToken(store, creds, certs, sshKeys, auditLog, named)))
-	mux.HandleFunc("GET /tokens", requireAPIKey(controlKey, handleListTokens(store)))
-	mux.HandleFunc("DELETE /tokens/{token}", requireAPIKey(controlKey, handleRevokeToken(store, auditLog, reaper)))
-	mux.HandleFunc("DELETE /tasks/{task_id}/tokens", requireAPIKey(controlKey, handleRevokeByTask(store, auditLog)))
-	mux.HandleFunc("GET /policies", requireAPIKey(controlKey, handleListPolicies(pol)))
+	mux.HandleFunc("POST /tokens", requireControlAuth(controlKey, peerAllow, handleIssueToken(store, creds, certs, sshKeys, auditLog, named)))
+	mux.HandleFunc("GET /tokens", requireControlAuth(controlKey, peerAllow, handleListTokens(store)))
+	mux.HandleFunc("DELETE /tokens/{token}", requireControlAuth(controlKey, peerAllow, handleRevokeToken(store, auditLog, reaper)))
+	mux.HandleFunc("DELETE /tasks/{task_id}/tokens", requireControlAuth(controlKey, peerAllow, handleRevokeByTask(store, auditLog)))
+	mux.HandleFunc("GET /policies", requireControlAuth(controlKey, peerAllow, handleListPolicies(pol)))
 	// What is registered, by name. Never a value: an operator asking "can the
 	// broker use the github credential" should not have to cause an error to find
 	// out, which was the only way before this existed.
 	// What happened, optionally for one task. Entries name tokens by id and carry
 	// no secret, which is what makes this safe to hand to whoever asked.
-	mux.HandleFunc("GET /audit", requireAPIKey(controlKey, func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("GET /audit", requireControlAuth(controlKey, peerAllow, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"entries": recent.Entries(r.URL.Query().Get("task_id")),
 		})
 	}))
-	mux.HandleFunc("GET /credentials", requireAPIKey(controlKey, func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("GET /credentials", requireControlAuth(controlKey, peerAllow, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"credentials": named.Names(),
@@ -272,11 +299,11 @@ func main() {
 			"keyring":     named.KeyringEnabled(),
 		})
 	}))
-	mux.HandleFunc("PUT /credentials/{id}", requireAPIKey(controlKey, handleRotateCredential(creds, store, auditLog)))
-	mux.HandleFunc("PUT /credentials/{id}/cert", requireAPIKey(controlKey, handleRotateCert(certs, auditLog)))
-	mux.HandleFunc("PUT /credentials/{id}/sshkey", requireAPIKey(controlKey, handleRotateSSHKey(sshKeys, auditLog)))
-	mux.HandleFunc("POST /webhooks", requireAPIKey(controlKey, handleRegisterWebhook(auditLog)))
-	mux.HandleFunc("GET /events", requireAPIKey(controlKey, sseSink.ServeHTTP))
+	mux.HandleFunc("PUT /credentials/{id}", requireControlAuth(controlKey, peerAllow, handleRotateCredential(creds, store, auditLog)))
+	mux.HandleFunc("PUT /credentials/{id}/cert", requireControlAuth(controlKey, peerAllow, handleRotateCert(certs, auditLog)))
+	mux.HandleFunc("PUT /credentials/{id}/sshkey", requireControlAuth(controlKey, peerAllow, handleRotateSSHKey(sshKeys, auditLog)))
+	mux.HandleFunc("POST /webhooks", requireControlAuth(controlKey, peerAllow, handleRegisterWebhook(auditLog)))
+	mux.HandleFunc("GET /events", requireControlAuth(controlKey, peerAllow, sseSink.ServeHTTP))
 	// The CA certificate, unauthenticated because it is public by definition:
 	// every agent behind this proxy has to trust it, and it is exported
 	// world-readable wherever -certs-dir points. Serving it means a client does
@@ -301,18 +328,36 @@ func main() {
 	log.Printf("  export SSL_CERT_FILE=%s/ca.pem", caDir)
 	log.Printf("")
 	log.Printf("issue a token:")
-	log.Printf(`  curl -X POST http://%s/tokens \`, reportedAPI)
+	if apiHasUnix && !apiHasTCP {
+		log.Printf(`  curl --unix-socket %s -X POST http://localhost/tokens \`, strings.TrimPrefix(reportedAPI, "unix:"))
+	} else {
+		log.Printf(`  curl -X POST http://%s/tokens \`, reportedAPI)
+	}
 	log.Printf(`    -d '{"credential":"sk-ant-...","destinations":["api.anthropic.com"]}'`)
 
+	apiServer := &http.Server{Handler: mux, ConnContext: controlConnContext}
+	apiListeners := make([]net.Listener, 0, 2)
 	if apiListener != nil {
-		if err := http.Serve(apiListener, mux); err != nil {
+		apiListeners = append(apiListeners, apiListener)
+	}
+	if controlListener != nil {
+		apiListeners = append(apiListeners, controlListener)
+	}
+	if len(apiListeners) == 0 {
+		network, address := controlListenAddress(*apiAddr)
+		apiListener, err = net.Listen(network, address)
+		if err != nil {
 			log.Fatalf("api: %v", err)
 		}
-		return
+		apiListeners = append(apiListeners, apiListener)
 	}
-	if err := http.ListenAndServe(*apiAddr, mux); err != nil {
-		log.Fatalf("api: %v", err)
+	serverErrors := make(chan error, len(apiListeners))
+	for _, listener := range apiListeners {
+		go func() {
+			serverErrors <- apiServer.Serve(listener)
+		}()
 	}
+	log.Fatalf("api: %v", <-serverErrors)
 }
 
 // resolveAPIKey answers the control API key, from a file when one is named.

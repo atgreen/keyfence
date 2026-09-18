@@ -9,7 +9,7 @@
 #
 # This unit has no [Install] section on purpose.  It is started by its sockets:
 #
-#     systemctl --user enable --now keyfence.socket keyfence-api.socket
+#     systemctl --user enable --now keyfence.socket keyfence-control.socket
 #
 # Enabling both a socket and the service itself would have them race for the
 # same ports, so the way to avoid that is not to document it -- it is to leave
@@ -28,7 +28,7 @@ Type=simple
 # The sockets whose descriptors this service should receive.  Any of them that
 # is running hands its listener over; anything not passed in, KeyFence binds for
 # itself, on loopback.
-Sockets=keyfence.socket keyfence-api.socket keyfence-ssh.socket
+Sockets=keyfence.socket keyfence-api.socket keyfence-control.socket keyfence-ssh.socket
 
 # The control API can issue and revoke credentials, so it gets a key whether or
 # not anyone remembered to make one.  Generated once, kept where the owner alone
@@ -36,7 +36,7 @@ Sockets=keyfence.socket keyfence-api.socket keyfence-ssh.socket
 # process of this user could read it out of /proc.
 ExecStartPre=/bin/sh -c 'mkdir -p %h/.keyfence && test -s %h/.keyfence/api-key || { umask 077; head -c 16 /dev/urandom | od -An -tx1 | tr -d " \\n" > %h/.keyfence/api-key; }'
 ExecStart=/usr/bin/keyfence -data-dir %h/.keyfence -api-key-file %h/.keyfence/api-key \
-    -credentials-dir %h/.keyfence/credentials
+    -api-allow-uid %U -credentials-dir %h/.keyfence/credentials
 
 # Credentials registered by name live in %h/.keyfence/credentials, one file each,
 # and are resolved per request -- so rotating one is replacing a file. Tokens can

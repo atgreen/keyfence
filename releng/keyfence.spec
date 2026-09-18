@@ -47,6 +47,7 @@ install -Dpm 0755 keyfence %{buildroot}%{_bindir}/keyfence
 install -Dpm 0644 releng/keyfence.service %{buildroot}%{_userunitdir}/keyfence.service
 install -Dpm 0644 releng/keyfence.socket %{buildroot}%{_userunitdir}/keyfence.socket
 install -Dpm 0644 releng/keyfence-api.socket %{buildroot}%{_userunitdir}/keyfence-api.socket
+install -Dpm 0644 releng/keyfence-control.socket %{buildroot}%{_userunitdir}/keyfence-control.socket
 install -Dpm 0644 releng/keyfence-ssh.socket %{buildroot}%{_userunitdir}/keyfence-ssh.socket
 
 %files
@@ -56,6 +57,7 @@ install -Dpm 0644 releng/keyfence-ssh.socket %{buildroot}%{_userunitdir}/keyfenc
 %{_userunitdir}/keyfence.service
 %{_userunitdir}/keyfence.socket
 %{_userunitdir}/keyfence-api.socket
+%{_userunitdir}/keyfence-control.socket
 %{_userunitdir}/keyfence-ssh.socket
 
 # These run "systemctl --user preset", which applies preset policy rather than
@@ -64,10 +66,10 @@ install -Dpm 0644 releng/keyfence-ssh.socket %{buildroot}%{_userunitdir}/keyfenc
 # installs the package would open a token-minting API that nobody asked for --
 # and with an empty credential store it could not do anything useful anyway.
 %post
-%systemd_user_post keyfence.service keyfence.socket keyfence-api.socket keyfence-ssh.socket
+%systemd_user_post keyfence.service keyfence.socket keyfence-api.socket keyfence-control.socket keyfence-ssh.socket
 
 %preun
-%systemd_user_preun keyfence.service keyfence.socket keyfence-api.socket keyfence-ssh.socket
+%systemd_user_preun keyfence.service keyfence.socket keyfence-api.socket keyfence-control.socket keyfence-ssh.socket
 
 %postun
 %systemd_user_postun_with_restart keyfence.service

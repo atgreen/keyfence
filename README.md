@@ -104,11 +104,13 @@ sockets rather than the service and systemd holds the ports, starting KeyFence
 on the first connection — an enabled broker with nothing to do costs nothing:
 
 ```bash
-systemctl --user enable --now keyfence.socket keyfence-api.socket
+systemctl --user enable --now keyfence.socket keyfence-control.socket
 ```
 
-That generates a control API key on first start at `~/.keyfence/api-key`,
-readable only by you, and keeps the CA at `~/.keyfence/ca/ca.pem`.
+The control socket authorizes the calling process from the UID reported by the
+kernel, so local clients do not need a bearer key. It is available at
+`$XDG_RUNTIME_DIR/keyfence/control.sock`. The CA remains at
+`~/.keyfence/ca/ca.pem`.
 
 `keyfence-ssh.socket` enables the SSH bastion. It authenticates upstream hosts
 against `~/.keyfence/ssh/known_hosts`, so populate that first —
@@ -199,6 +201,23 @@ user, which is why a file is better. Under systemd, `LoadCredential=` puts one
 in `$CREDENTIALS_DIRECTORY` and KeyFence looks there for `api-key` without being
 told to.
 
+For local callers, a Unix socket avoids distributing that bearer key. Numeric
+UID and primary-GID allowlists are explicit and repeatable:
+
+```bash
+keyfence -api unix:$XDG_RUNTIME_DIR/keyfence-control.sock \
+  -api-allow-uid "$(id -u)" -api-allow-group "$(id -g)"
+
+curl --unix-socket "$XDG_RUNTIME_DIR/keyfence-control.sock" \
+  -X POST http://localhost/tokens -d '...'
+```
+
+On Linux, KeyFence reads `SO_PEERCRED` from each accepted connection. A bearer
+header cannot override a peer that is absent from the allowlist. The packaged
+`keyfence-control.socket` supplies the Unix listener through systemd socket
+activation and allows the service user's UID. The TCP `keyfence-api.socket`
+remains available for deployments that use bearer authentication.
+
 A request with no `kf_` token is refused with 401 and a
 `WWW-Authenticate: Basic` challenge, because that is what 401 means and some
 clients wait to be asked. git is one: it sends no credential on its first request
@@ -206,7 +225,7 @@ and offers Basic only in answer to a challenge, so without the header a clone
 through the proxy failed with "Authentication failed" having never sent the token
 it was holding.
 
-All control API endpoints except `/health` require the key as a Bearer token:
+All TCP control API endpoints except `/health` require the key as a Bearer token:
 
 ```bash
 curl -H "Authorization: Bearer $KEYFENCE_API_KEY" \
