@@ -18,35 +18,35 @@ import (
 
 // Event types.
 const (
-	EventAllow    = "allow"
-	EventDeny     = "deny"
-	EventIssue    = "issue"
-	EventRevoke   = "revoke"
-	EventSSHAllow = "ssh_allow"
-	EventSSHDeny  = "ssh_deny"
+	EventAllow        = "allow"
+	EventDeny         = "deny"
+	EventIssue        = "issue"
+	EventRevoke       = "revoke"
+	EventSSHAllow     = "ssh_allow"
+	EventSSHDeny      = "ssh_deny"
 	EventRotate       = "rotate"
 	EventResponseRule = "response_rule"
 )
 
 // Entry is a single audit log record.
 type Entry struct {
-	Timestamp   string `json:"ts"`
-	Event       string `json:"event"`
-	TokenID     string `json:"token_id,omitempty"`
-	AgentID     string `json:"agent_id,omitempty"`
-	TaskID      string `json:"task_id,omitempty"`
-	Destination string `json:"destination,omitempty"`
-	Method      string `json:"method,omitempty"`
-	Path        string `json:"path,omitempty"`
-	DenyReason  string `json:"deny_reason,omitempty"`
-	DenyRule    string `json:"deny_rule,omitempty"`
+	Timestamp    string `json:"ts"`
+	Event        string `json:"event"`
+	TokenID      string `json:"token_id,omitempty"`
+	AgentID      string `json:"agent_id,omitempty"`
+	TaskID       string `json:"task_id,omitempty"`
+	Destination  string `json:"destination,omitempty"`
+	Method       string `json:"method,omitempty"`
+	Path         string `json:"path,omitempty"`
+	DenyReason   string `json:"deny_reason,omitempty"`
+	DenyRule     string `json:"deny_rule,omitempty"`
 	SSHCommand   string `json:"ssh_command,omitempty"`
 	CredentialID string `json:"credential_id,omitempty"`
 	RuleAction   string `json:"rule_action,omitempty"`
 	RuleReason   string `json:"rule_reason,omitempty"`
 	Label        string `json:"label,omitempty"`
-	Policy      string `json:"policy,omitempty"`
-	TTL         string `json:"ttl,omitempty"`
+	Policy       string `json:"policy,omitempty"`
+	TTL          string `json:"ttl,omitempty"`
 }
 
 // Sink receives audit entries for fan-out (webhooks, SSE, etc.).

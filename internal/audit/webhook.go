@@ -19,7 +19,7 @@ import (
 // entries are dropped (the proxy is never blocked by a slow webhook).
 type WebhookSink struct {
 	URL    string
-	Secret string // HMAC-SHA256 signing key; empty = no signature
+	Secret string          // HMAC-SHA256 signing key; empty = no signature
 	Events map[string]bool // filter; nil = all events
 	queue  chan Entry
 	client *http.Client

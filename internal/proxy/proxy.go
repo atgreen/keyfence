@@ -44,14 +44,14 @@ import (
 // about Anthropic, OpenAI, or any other API. The token carries all
 // the information: what credential to inject and where it's allowed.
 type Proxy struct {
-	ca        *CA
-	store     *tokenstore.Store
-	creds     credstore.Backend
-	certs     *credstore.CertStore
-	policy    *policy.Engine
-	audit     *audit.Logger
-	lua       *luaengine.Engine
-	addr      string
+	ca     *CA
+	store  *tokenstore.Store
+	creds  credstore.Backend
+	certs  *credstore.CertStore
+	policy *policy.Engine
+	audit  *audit.Logger
+	lua    *luaengine.Engine
+	addr   string
 }
 
 func New(addr string, ca *CA, store *tokenstore.Store, creds credstore.Backend, certs *credstore.CertStore, pol *policy.Engine, auditLog *audit.Logger) *Proxy {
@@ -359,7 +359,7 @@ func (p *Proxy) forwardRequest(req *http.Request, host string, clientCert *tls.C
 	}
 
 	transport := &http.Transport{
-		TLSClientConfig: tlsConfig,
+		TLSClientConfig:       tlsConfig,
 		TLSHandshakeTimeout:   10 * time.Second,
 		ResponseHeaderTimeout: 30 * time.Second,
 	}

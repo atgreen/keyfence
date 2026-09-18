@@ -312,20 +312,20 @@ func exportCACert(ca *proxy.CA, dir string) error {
 }
 
 type issueRequest struct {
-	Credential        string   `json:"credential"`
-	Destinations      []string `json:"destinations"`
-	TTLSeconds        int      `json:"ttl_seconds"`
-	Label             string   `json:"label"`
-	Policy            string   `json:"policy"`
-	AgentID           string   `json:"agent_id"`
-	TaskID            string   `json:"task_id"`
-	RateLimit         int      `json:"rate_limit"`
-	RateWindowSeconds int      `json:"rate_window_seconds"`
-	ClientCert        string   `json:"client_cert"`
-	ClientKey         string   `json:"client_key"`
-	ClientCertHeader  string   `json:"client_cert_header"`
-	SSHPrivateKey     string                   `json:"ssh_private_key"`
-	SSHUsername       string                   `json:"ssh_username"`
+	Credential        string                    `json:"credential"`
+	Destinations      []string                  `json:"destinations"`
+	TTLSeconds        int                       `json:"ttl_seconds"`
+	Label             string                    `json:"label"`
+	Policy            string                    `json:"policy"`
+	AgentID           string                    `json:"agent_id"`
+	TaskID            string                    `json:"task_id"`
+	RateLimit         int                       `json:"rate_limit"`
+	RateWindowSeconds int                       `json:"rate_window_seconds"`
+	ClientCert        string                    `json:"client_cert"`
+	ClientKey         string                    `json:"client_key"`
+	ClientCertHeader  string                    `json:"client_cert_header"`
+	SSHPrivateKey     string                    `json:"ssh_private_key"`
+	SSHUsername       string                    `json:"ssh_username"`
 	ResponseRules     []tokenstore.ResponseRule `json:"response_rules"`
 }
 

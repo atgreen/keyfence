@@ -30,8 +30,8 @@ type Policy struct {
 	DeniedPaths  []string
 
 	// Rate limiting.
-	RateLimit    int           // max requests per window; 0 = unlimited
-	RateWindow   time.Duration // window duration
+	RateLimit  int           // max requests per window; 0 = unlimited
+	RateWindow time.Duration // window duration
 
 	// Per-token request budget. 0 = unlimited.
 	MaxRequests int
@@ -68,7 +68,7 @@ type Engine struct {
 }
 
 type rateState struct {
-	count      int
+	count       int
 	windowStart time.Time
 }
 

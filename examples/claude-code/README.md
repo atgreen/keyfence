@@ -53,9 +53,11 @@ podman build -t keyfence-claude-code -f Containerfile.claude .
 KEYFENCE_API_KEY=$(openssl rand -hex 16)
 podman pod create --name kf -p 10212:10212
 podman volume create kf-certs
+printf '%s' "$KEYFENCE_API_KEY" | podman secret create kf-api-key -
 podman run -d --pod kf --name kf-keyfence \
     -v kf-certs:/certs \
-    keyfence --certs-dir /certs --api-key "$KEYFENCE_API_KEY"
+    --secret kf-api-key,target=/run/secrets/api-key \
+    keyfence --certs-dir /certs --api-key-file /run/secrets/api-key
 
 # 3. Issue a token
 KEYFENCE_TOKEN=$(curl -sf -X POST http://localhost:10212/tokens \

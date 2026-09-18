@@ -50,11 +50,16 @@ podman volume create "${POD_NAME}-certs"
 
 # ── 5. Start KeyFence ──────────────────────────────────────────────────
 echo "==> Starting KeyFence..."
+# As a podman secret, not on the command line where /proc would show it.
+podman secret rm "${POD_NAME}-api-key" 2>/dev/null || true
+printf '%s' "$KEYFENCE_API_KEY" | podman secret create "${POD_NAME}-api-key" -
+
 podman run -d --pod "$POD_NAME" --name "${POD_NAME}-keyfence" \
     -v "${POD_NAME}-certs:/certs" \
+    --secret "${POD_NAME}-api-key,target=/run/secrets/api-key" \
     "$KEYFENCE_IMAGE" \
     --certs-dir /certs \
-    --api-key "$KEYFENCE_API_KEY"
+    --api-key-file /run/secrets/api-key
 
 echo "==> Waiting for KeyFence health check..."
 RETRIES=0

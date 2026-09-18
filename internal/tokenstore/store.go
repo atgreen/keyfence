@@ -20,20 +20,20 @@ import (
 
 type Token struct {
 	ID                  string
-	Value               string   // kf_<random>
-	CredentialID        string   // reference into credential backend
-	AllowedDestinations []string // hosts or host/path patterns this token can be used against
-	PolicyName          string   // optional policy to evaluate on each request
-	AgentID             string        // orchestrator-assigned agent identity
-	TaskID              string        // orchestrator-assigned task scope
-	RateLimit           int           // max requests per window; 0 = unlimited
-	RateWindow          time.Duration // window duration
-	ClientCertID        string        // reference to cert+key in cert store
-	ClientCertHeader    string        // header to inject cert PEM into (optional)
-	SSHKeyID            string        // reference to SSH key in SSH key store
-	ResponseRules       []ResponseRule // Lua scripts evaluated against each response
+	Value               string                 // kf_<random>
+	CredentialID        string                 // reference into credential backend
+	AllowedDestinations []string               // hosts or host/path patterns this token can be used against
+	PolicyName          string                 // optional policy to evaluate on each request
+	AgentID             string                 // orchestrator-assigned agent identity
+	TaskID              string                 // orchestrator-assigned task scope
+	RateLimit           int                    // max requests per window; 0 = unlimited
+	RateWindow          time.Duration          // window duration
+	ClientCertID        string                 // reference to cert+key in cert store
+	ClientCertHeader    string                 // header to inject cert PEM into (optional)
+	SSHKeyID            string                 // reference to SSH key in SSH key store
+	ResponseRules       []ResponseRule         // Lua scripts evaluated against each response
 	RuleState           map[string]interface{} // mutable state persisted across requests
-	RuleStateMu         sync.Mutex    // protects RuleState
+	RuleStateMu         sync.Mutex             // protects RuleState
 	CreatedAt           time.Time
 	ExpiresAt           time.Time
 	Label               string // optional human-readable label
