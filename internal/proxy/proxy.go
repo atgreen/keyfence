@@ -22,6 +22,7 @@ import (
 
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/keyfence/keyfence/internal/audit"
 	"github.com/keyfence/keyfence/internal/credstore"
@@ -154,21 +155,102 @@ func (p *Proxy) handleConn(conn net.Conn) {
 	defer func() { _ = conn.Close() }()
 
 	br := bufio.NewReader(conn)
+
+	// A TLS record begins with 0x16, an HTTP request never does. That is enough to
+	// tell a client that set HTTPS_PROXY -- which sends CONNECT first -- from one
+	// that did not and was redirected here by the kernel, which starts talking TLS
+	// at whatever it thinks it dialled.
+	//
+	// Being able to serve the second is what makes the proxy unavoidable rather
+	// than merely mandatory: a tool that ignores proxy environment variables gets
+	// proxied anyway instead of failing.
+	first, err := br.Peek(1)
+	if err != nil {
+		return
+	}
+	if first[0] == 0x16 {
+		p.serveRedirectedTLS(&bufferedConn{Reader: br, Conn: conn})
+		return
+	}
+
 	req, err := http.ReadRequest(br)
 	if err != nil {
 		return
 	}
 
-	if req.Method == http.MethodConnect {
+	switch {
+	case req.Method == http.MethodConnect:
 		p.handleConnect(conn, req)
-	} else {
-		// Plain HTTP: health check or error
-		if req.URL.Path == "/_health" {
-			writeJSON(conn, 200, `{"status":"ok","service":"keyfence"}`)
-			return
-		}
+	case req.URL.Path == "/_health":
+		writeJSON(conn, 200, `{"status":"ok","service":"keyfence"}`)
+	case req.Host != "" && !strings.HasPrefix(req.URL.Path, "/_"):
+		// Plain HTTP, redirected here: the Host header says where it was going.
+		p.serveRedirectedPlain(&bufferedConn{Reader: br, Conn: conn}, req)
+	default:
 		writeError(conn, 400, "keyfence is an HTTPS proxy. Set HTTPS_PROXY=http://127.0.0.1"+p.addr+" and use https:// URLs")
 	}
+}
+
+// bufferedConn is a connection whose first bytes have already been read into a
+// buffer, so that peeking at them does not consume them.
+type bufferedConn struct {
+	*bufio.Reader
+	net.Conn
+}
+
+func (c *bufferedConn) Read(p []byte) (int, error) { return c.Reader.Read(p) }
+
+// serveRedirectedTLS handles a TLS connection that arrived without a CONNECT,
+// because something rewrote its destination to this proxy.
+//
+// Where it was going is in the ClientHello: the SNI names the host the client
+// believes it is talking to, which is the same thing the certificate has to be
+// issued for. So the destination is recovered from the handshake rather than from
+// the kernel -- no SO_ORIGINAL_DST, no socket cookie to correlate.
+func (p *Proxy) serveRedirectedTLS(conn net.Conn) {
+	var hostname string
+	tlsConn := tls.Server(conn, &tls.Config{
+		GetCertificate: func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
+			hostname = hello.ServerName
+			return p.ca.GetCertificate(hello)
+		},
+	})
+	if err := tlsConn.HandshakeContext(context.Background()); err != nil {
+		// No SNI is the interesting failure: a client dialling an IP literal
+		// cannot say where it meant to go, so there is nothing to proxy it to.
+		log.Printf("redirected TLS handshake: %v", err)
+		return
+	}
+	defer func() { _ = tlsConn.Close() }()
+	if hostname == "" {
+		return
+	}
+
+	ctx, span := telemetry.Tracer().Start(context.Background(), "proxy.redirected",
+		telemetry.WithSpanAttributes(attribute.String("net.peer.name", hostname)))
+	defer span.End()
+
+	p.serveTunnel(ctx, tlsConn, hostname, span)
+}
+
+// serveRedirectedPlain handles cleartext HTTP that arrived without a CONNECT.
+// The Host header is where it was going.
+func (p *Proxy) serveRedirectedPlain(conn net.Conn, first *http.Request) {
+	hostname := strings.Split(first.Host, ":")[0]
+	if hostname == "" {
+		writeError(conn, 400, "no Host header, so there is nothing to proxy this to")
+		return
+	}
+	ctx, span := telemetry.Tracer().Start(context.Background(), "proxy.redirected",
+		telemetry.WithSpanAttributes(attribute.String("net.peer.name", hostname)))
+	defer span.End()
+
+	first.URL.Scheme = "http"
+	first.URL.Host = first.Host
+	if !p.processRequest(ctx, conn, first, hostname) {
+		return
+	}
+	p.serveRequests(ctx, conn, bufio.NewReader(conn), hostname, "http", span)
 }
 
 // handleConnect handles HTTPS CONNECT tunneling with MITM.
@@ -211,28 +293,39 @@ func (p *Proxy) handleConnect(conn net.Conn, req *http.Request) {
 	}
 	defer func() { _ = tlsConn.Close() }()
 
-	// Read requests inside the TLS tunnel until the client stops sending them.
-	//
-	// One per tunnel was the old behaviour, which meant an agent making twenty
-	// API calls paid twenty TCP connections and twenty TLS handshakes -- to the
-	// proxy on loopback, and again to the upstream. HTTP/1.1 keep-alive is the
-	// client's default, and this honours it: a request is followed by another on
-	// the same connection unless one side says otherwise.
-	br := bufio.NewReader(tlsConn)
+	p.serveTunnel(ctx, tlsConn, hostname, span)
+}
+
+// serveTunnel serves requests on an established, decrypted connection, however it
+// came to be established: a CONNECT tunnel the client asked for, or a TLS stream
+// redirected here by the kernel.
+func (p *Proxy) serveTunnel(ctx context.Context, conn net.Conn, hostname string, span trace.Span) {
+	p.serveRequests(ctx, conn, bufio.NewReader(conn), hostname, "https", span)
+}
+
+// serveRequests reads requests until the client stops sending them.
+//
+// One per connection was the old behaviour, which meant an agent making twenty
+// API calls paid twenty TCP connections and twenty TLS handshakes -- to the proxy
+// on loopback, and again to the upstream. HTTP/1.1 keep-alive is the client's
+// default, and this honours it: a request is followed by another on the same
+// connection unless one side says otherwise.
+func (p *Proxy) serveRequests(ctx context.Context, conn net.Conn, br *bufio.Reader,
+	hostname, scheme string, span trace.Span) {
 	for {
-		innerReq, err := http.ReadRequest(br)
+		req, err := http.ReadRequest(br)
 		if err != nil {
 			// EOF is the ordinary end of a keep-alive connection, not a fault.
 			if err != io.EOF {
-				log.Printf("read inner request for %s: %v", hostname, err)
-				span.SetStatus(codes.Error, "read inner request")
+				log.Printf("read request for %s: %v", hostname, err)
+				span.SetStatus(codes.Error, "read request")
 			}
 			return
 		}
-		innerReq.URL.Scheme = "https"
-		innerReq.URL.Host = hostname
+		req.URL.Scheme = scheme
+		req.URL.Host = hostname
 
-		if !p.processRequest(ctx, tlsConn, innerReq, hostname) {
+		if !p.processRequest(ctx, conn, req, hostname) {
 			return
 		}
 	}
