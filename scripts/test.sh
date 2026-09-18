@@ -60,9 +60,14 @@ for port in "$PROXY_PORT" "$API_PORT" "$SSH_PORT"; do
 done
 
 info "starting keyfence (data-dir=$DATA_DIR, api=:$API_PORT)..."
-# --insecure-api: the control API refuses to run without a key, and these tests
-# talk to it directly. Unauthenticated is fine here, and now it has to be said.
-./bin/keyfence --insecure-api --data-dir "$DATA_DIR" --proxy "127.0.0.1:$PROXY_PORT" --api "127.0.0.1:$API_PORT" --ssh "127.0.0.1:$SSH_PORT" &
+# With a control API key, because that is how anyone should run it: the suite
+# should exercise the path that production uses, not the one that skips it.
+KEYFENCE_API_KEY=$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')
+printf '%s' "$KEYFENCE_API_KEY" > "$DATA_DIR/api-key"
+chmod 600 "$DATA_DIR/api-key"
+AUTH="Authorization: Bearer $KEYFENCE_API_KEY"
+
+./bin/keyfence --api-key-file "$DATA_DIR/api-key" --data-dir "$DATA_DIR" --proxy "127.0.0.1:$PROXY_PORT" --api "127.0.0.1:$API_PORT" --ssh "127.0.0.1:$SSH_PORT" &
 KEYFENCE_PID=$!
 sleep 1
 
@@ -109,6 +114,16 @@ fi
 
 # All tests use MITM proxy mode (HTTPS_PROXY + CONNECT)
 
+# --- Test 0: the control API refuses callers without the key ---
+info "test 0: unauthenticated control API call → 401"
+STATUS=$(curl -s -o /dev/null -w '%{http_code}' -X POST http://localhost:$API_PORT/tokens \
+    -d "{\"credential\":\"$CRED\",\"destinations\":[\"api.anthropic.com\"],\"ttl_seconds\":60}")
+if [ "$STATUS" = "401" ]; then
+    pass "test 0: minting without the control key refused (401)"
+else
+    fail "test 0: expected 401 minting without the control key, got $STATUS"
+fi
+
 # --- Test 1: No token → 401 ---
 info "test 1: request without token → 401"
 STATUS=$(curl -s -o /dev/null -w '%{http_code}' \
@@ -129,7 +144,7 @@ if [ "$UPSTREAM_REACHABLE" != "true" ]; then
     skip "test 2: needs api.anthropic.com to answer"
 else
 info "test 2: issue token and make authenticated request"
-TOKEN=$(curl -sf -X POST http://localhost:$API_PORT/tokens \
+TOKEN=$(curl -sf -X POST -H "$AUTH" http://localhost:$API_PORT/tokens \
     -d "{\"credential\":\"$CRED\",\"destinations\":[\"api.anthropic.com\"],\"ttl_seconds\":60}" | \
     python3 -c "import sys,json; print(json.load(sys.stdin)['token'])")
 
@@ -168,7 +183,7 @@ fi
 
 # --- Test 3: Expired token → 403 ---
 info "test 3: expired token → 403"
-EXPIRED_TOKEN=$(curl -sf -X POST http://localhost:$API_PORT/tokens \
+EXPIRED_TOKEN=$(curl -sf -X POST -H "$AUTH" http://localhost:$API_PORT/tokens \
     -d "{\"credential\":\"$CRED\",\"destinations\":[\"api.anthropic.com\"],\"ttl_seconds\":1}" | \
     python3 -c "import sys,json; print(json.load(sys.stdin)['token'])")
 
@@ -193,7 +208,7 @@ fi
 info "test 4: token for anthropic used against openai → 403"
 # Its own token rather than test 2's: a test that borrows another's state fails
 # for the wrong reason the moment that one is skipped.
-DEST_TOKEN=$(curl -sf -X POST http://localhost:$API_PORT/tokens \
+DEST_TOKEN=$(curl -sf -X POST -H "$AUTH" http://localhost:$API_PORT/tokens \
     -d "{\"credential\":\"$CRED\",\"destinations\":[\"api.anthropic.com\"],\"ttl_seconds\":300}" | \
     python3 -c "import sys,json; print(json.load(sys.stdin)['token'])")
 STATUS=$(curl -s -o /dev/null -w '%{http_code}' \
@@ -212,11 +227,11 @@ fi
 
 # --- Test 5: Token revocation ---
 info "test 5: revoked token → 403"
-REVOKE_TOKEN=$(curl -sf -X POST http://localhost:$API_PORT/tokens \
+REVOKE_TOKEN=$(curl -sf -X POST -H "$AUTH" http://localhost:$API_PORT/tokens \
     -d "{\"credential\":\"$CRED\",\"destinations\":[\"api.anthropic.com\"],\"ttl_seconds\":300}" | \
     python3 -c "import sys,json; print(json.load(sys.stdin)['token'])")
 
-curl -sf -X DELETE "http://localhost:$API_PORT/tokens/$REVOKE_TOKEN" > /dev/null
+curl -sf -X DELETE "-H "$AUTH" http://localhost:$API_PORT/tokens/$REVOKE_TOKEN" > /dev/null
 
 STATUS=$(curl -s -o /dev/null -w '%{http_code}' \
     --proxy http://127.0.0.1:$PROXY_PORT \
@@ -235,7 +250,7 @@ fi
 
 # --- Test 6: List tokens ---
 info "test 6: list tokens returns valid JSON array"
-LIST_RESPONSE=$(curl -sf http://localhost:$API_PORT/tokens)
+LIST_RESPONSE=$(curl -sf -H "$AUTH" http://localhost:$API_PORT/tokens)
 TOKEN_COUNT=$(echo "$LIST_RESPONSE" | python3 -c "import sys,json; print(len(json.load(sys.stdin)))")
 
 if [ "$TOKEN_COUNT" -gt 0 ]; then
@@ -248,7 +263,7 @@ fi
 # Omitting destinations is refused: an empty list means nothing is permitted, and
 # a token that works anywhere has to be asked for as ["*"].
 info "test 7a: a token with no destinations at all is refused"
-STATUS=$(curl -s -o /dev/null -w '%{http_code}' -X POST http://localhost:$API_PORT/tokens \
+STATUS=$(curl -s -o /dev/null -w '%{http_code}' -X POST -H "$AUTH" http://localhost:$API_PORT/tokens \
     -d "{\"credential\":\"$CRED\",\"ttl_seconds\":60}")
 if [ "$STATUS" = "400" ]; then
     pass "test 7a: issuing without destinations refused (400)"
@@ -260,7 +275,7 @@ if [ "$UPSTREAM_REACHABLE" != "true" ]; then
     skip "test 7: needs api.anthropic.com to answer"
 else
 info "test 7: token with an explicit wildcard destination"
-WILDCARD_TOKEN=$(curl -sf -X POST http://localhost:$API_PORT/tokens \
+WILDCARD_TOKEN=$(curl -sf -X POST -H "$AUTH" http://localhost:$API_PORT/tokens \
     -d "{\"credential\":\"$CRED\",\"destinations\":[\"*\"],\"ttl_seconds\":60}" | \
     python3 -c "import sys,json; print(json.load(sys.stdin)['token'])")
 
@@ -283,7 +298,7 @@ fi
 
 # --- Test 8: Readonly policy blocks POST ---
 info "test 8: readonly policy blocks POST requests"
-READONLY_TOKEN=$(curl -sf -X POST http://localhost:$API_PORT/tokens \
+READONLY_TOKEN=$(curl -sf -X POST -H "$AUTH" http://localhost:$API_PORT/tokens \
     -d "{\"credential\":\"$CRED\",\"destinations\":[\"api.anthropic.com\"],\"ttl_seconds\":60,\"policy\":\"readonly\"}" | \
     python3 -c "import sys,json; print(json.load(sys.stdin)['token'])")
 
@@ -304,7 +319,7 @@ fi
 
 # --- Test 9: List policies ---
 info "test 9: list policies returns built-in policies"
-POLICY_COUNT=$(curl -sf http://localhost:$API_PORT/policies | \
+POLICY_COUNT=$(curl -sf -H "$AUTH" http://localhost:$API_PORT/policies | \
     python3 -c "import sys,json; print(len(json.load(sys.stdin)))")
 
 if [ "$POLICY_COUNT" -ge 4 ]; then
@@ -315,7 +330,7 @@ fi
 
 # --- Test 10: Basic auth token swap (git-style) ---
 info "test 10: Basic auth header with kf_ token"
-BASIC_TOKEN=$(curl -sf -X POST http://localhost:$API_PORT/tokens \
+BASIC_TOKEN=$(curl -sf -X POST -H "$AUTH" http://localhost:$API_PORT/tokens \
     -d "{\"credential\":\"$CRED\",\"destinations\":[\"api.anthropic.com\"],\"ttl_seconds\":60}" | \
     python3 -c "import sys,json; print(json.load(sys.stdin)['token'])")
 
@@ -343,7 +358,7 @@ fi
 
 # --- Test 11: Per-token rate limiting ---
 info "test 11: per-token rate limit (2 req/60s)"
-RATE_TOKEN=$(curl -sf -X POST http://localhost:$API_PORT/tokens \
+RATE_TOKEN=$(curl -sf -X POST -H "$AUTH" http://localhost:$API_PORT/tokens \
     -d "{\"credential\":\"$CRED\",\"destinations\":[\"api.anthropic.com\"],\"ttl_seconds\":60,\"rate_limit\":2,\"rate_window_seconds\":60}" | \
     python3 -c "import sys,json; print(json.load(sys.stdin)['token'])")
 
