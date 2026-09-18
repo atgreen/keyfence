@@ -41,7 +41,9 @@ go build -o ./bin/keyfence ./cmd/keyfence
 
 # --- Start KeyFence ---
 info "starting keyfence (data-dir=$DATA_DIR)..."
-./bin/keyfence --data-dir "$DATA_DIR" --proxy :10210 --api :10212 &
+# --insecure-api: the control API refuses to run without a key, and these tests
+# talk to it directly. Unauthenticated is fine here, and now it has to be said.
+./bin/keyfence --insecure-api --data-dir "$DATA_DIR" --proxy 127.0.0.1:10210 --api 127.0.0.1:10212 &
 KEYFENCE_PID=$!
 sleep 1
 

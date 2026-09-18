@@ -1,0 +1,67 @@
+# KeyFence, as a per-user service.
+#
+# SPDX-License-Identifier: MIT
+#
+# A user service rather than a system one, because what KeyFence holds is one
+# person's credentials: the credential store, the CA and the tokens all live
+# under that user's home directory, and a token it mints is for that user's
+# agents.
+#
+# This unit has no [Install] section on purpose.  It is started by its sockets:
+#
+#     systemctl --user enable --now keyfence.socket keyfence-api.socket
+#
+# Enabling both a socket and the service itself would have them race for the
+# same ports, so the way to avoid that is not to document it -- it is to leave
+# the service with nothing to enable.  To run it always-on instead:
+#
+#     systemctl --user add-wants default.target keyfence.service
+#     systemctl --user start keyfence.service
+
+[Unit]
+Description=KeyFence credential broker
+Documentation=https://github.com/atgreen/keyfence
+
+[Service]
+Type=simple
+
+# The sockets whose descriptors this service should receive.  Any of them that
+# is running hands its listener over; anything not passed in, KeyFence binds for
+# itself, on loopback.
+Sockets=keyfence.socket keyfence-api.socket keyfence-ssh.socket
+
+# The control API can issue and revoke credentials, so it gets a key whether or
+# not anyone remembered to make one.  Generated once, kept where the owner alone
+# can read it, and passed by filename rather than on a command line where every
+# process of this user could read it out of /proc.
+ExecStartPre=/bin/sh -c 'mkdir -p %h/.keyfence && test -s %h/.keyfence/api-key || { umask 077; head -c 16 /dev/urandom | od -An -tx1 | tr -d " \\n" > %h/.keyfence/api-key; }'
+ExecStart=/usr/bin/keyfence -data-dir %h/.keyfence -api-key-file %h/.keyfence/api-key
+
+Restart=on-failure
+RestartSec=2
+
+# This process holds the real credentials, which is the whole point of it: it
+# should be able to do less than the agent it protects, not more.
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.keyfence
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @obsolete
+CapabilityBoundingSet=
+UMask=0077

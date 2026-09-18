@@ -72,7 +72,14 @@ func (p *Proxy) ListenAndServe() error {
 	if err != nil {
 		return fmt.Errorf("listen %s: %w", p.addr, err)
 	}
-	log.Printf("proxy listening on %s", p.addr)
+	return p.Serve(ln)
+}
+
+// Serve accepts on a listener the caller already has. That is how a socket
+// passed in by systemd is used: the socket is already listening before this
+// process existed, so there is nothing here to bind.
+func (p *Proxy) Serve(ln net.Listener) error {
+	log.Printf("proxy listening on %s", ln.Addr())
 	for {
 		conn, err := ln.Accept()
 		if err != nil {

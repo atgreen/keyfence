@@ -1,0 +1,20 @@
+# Socket activation for KeyFence: the MITM proxy agents send their requests through.
+#
+# SPDX-License-Identifier: MIT
+#
+# Enabled, this costs nothing until something connects -- systemd holds the
+# port, and KeyFence is started on the first connection.  Loopback only: a
+# broker that issues credentials has no business listening to the network
+# because nobody said otherwise.
+
+[Unit]
+Description=KeyFence proxy socket
+Documentation=https://github.com/atgreen/keyfence
+
+[Socket]
+ListenStream=127.0.0.1:10210
+FileDescriptorName=proxy
+Service=keyfence.service
+
+[Install]
+WantedBy=sockets.target

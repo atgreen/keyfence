@@ -4,9 +4,13 @@
 // KeyFence — credential tokenization proxy for AI agents.
 //
 // Single binary:
-//   - MITM forward proxy on :10210 (agents set HTTPS_PROXY here)
-//   - SSH bastion on :10211 (agents use as SSH proxy for git)
-//   - Token management API on :10212
+//   - MITM forward proxy on 127.0.0.1:10210 (agents set HTTPS_PROXY here)
+//   - SSH bastion on 127.0.0.1:10211 (agents use as SSH proxy for git)
+//   - Token management API on 127.0.0.1:10212
+//
+// All three listen on loopback unless told otherwise, and the control API
+// refuses to run without a key unless -insecure-api says to. Under systemd it
+// can be socket-activated: see releng/keyfence.socket.
 //
 // KeyFence is service-agnostic. It doesn't know about Anthropic, OpenAI,
 // or any specific API. You issue a token for any credential, optionally
@@ -18,8 +22,8 @@
 //
 // Usage:
 //
-//	keyfence                               # start with defaults
-//	keyfence --data-dir ~/.keyfence       # specify data directory
+//	keyfence -api-key-file ~/.keyfence/api-key
+//	keyfence -data-dir ~/.keyfence         # specify data directory
 //
 // Issue a token:
 //
@@ -39,12 +43,15 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"time"
 
+	"github.com/keyfence/keyfence/internal/activation"
 	"github.com/keyfence/keyfence/internal/audit"
 	"github.com/keyfence/keyfence/internal/credstore"
 	"github.com/keyfence/keyfence/internal/policy"
@@ -55,13 +62,50 @@ import (
 )
 
 func main() {
-	proxyAddr := flag.String("proxy", ":10210", "proxy listen address")
-	sshAddr := flag.String("ssh", ":10211", "SSH bastion listen address")
-	apiAddr := flag.String("api", ":10212", "token management API listen address")
+	// Loopback by default. The control API issues credentials, and the proxy
+	// carries them; neither is something to publish on every interface because
+	// nobody said otherwise. Pass an explicit address to widen it -- in a pod,
+	// where the agent's container shares this network namespace, loopback is
+	// already what the agent connects to.
+	proxyAddr := flag.String("proxy", "127.0.0.1:10210", "proxy listen address")
+	sshAddr := flag.String("ssh", "127.0.0.1:10211", "SSH bastion listen address")
+	apiAddr := flag.String("api", "127.0.0.1:10212", "token management API listen address")
 	dataDir := flag.String("data-dir", defaultDataDir(), "data directory for CA certs")
 	certsDir := flag.String("certs-dir", "", "directory to export CA cert for agents (optional)")
-	apiKey := flag.String("api-key", "", "require this Bearer token on all control API requests (strongly recommended)")
+	apiKey := flag.String("api-key", "", "require this Bearer token on all control API requests")
+	apiKeyFile := flag.String("api-key-file", "", "read the control API key from this file, so it is not in argv")
+	insecureAPI := flag.Bool("insecure-api", false, "run the control API with no key at all (it can issue and revoke credentials)")
 	flag.Parse()
+
+	controlKey, err := resolveAPIKey(*apiKey, *apiKeyFile)
+	if err != nil {
+		log.Fatalf("api key: %v", err)
+	}
+	if controlKey == "" && !*insecureAPI {
+		log.Fatalf("refusing to start: the control API issues and revokes credentials, and " +
+			"no key was given.\n" +
+			"  Pass -api-key-file FILE (or -api-key), or -insecure-api if you " +
+			"really mean to leave it open.")
+	}
+	if controlKey == "" {
+		log.Printf("WARNING: -insecure-api given. Any process that can reach %s can issue and revoke tokens.", *apiAddr)
+	}
+
+	// Sockets systemd may have passed in. With socket activation the broker can
+	// be enabled without running: systemd holds the ports and starts this on the
+	// first connection.
+	activated, err := activation.Listeners()
+	if err != nil {
+		log.Fatalf("socket activation: %v", err)
+	}
+	// Taken once, up front, so that what gets logged is where things are
+	// actually listening rather than where the flags would have put them.
+	proxyListener := activation.Take(activated, "proxy")
+	sshListener := activation.Take(activated, "ssh")
+	apiListener := activation.Take(activated, "api")
+	reportedProxy := listeningOn(proxyListener, *proxyAddr)
+	reportedSSH := listeningOn(sshListener, *sshAddr)
+	reportedAPI := listeningOn(apiListener, *apiAddr)
 
 	// Initialize OpenTelemetry (configured via OTEL_* env vars)
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
@@ -125,6 +169,12 @@ func main() {
 	// Start HTTPS proxy
 	p := proxy.New(*proxyAddr, ca, store, creds, certs, pol, auditLog)
 	go func() {
+		if proxyListener != nil {
+			if err := p.Serve(proxyListener); err != nil {
+				log.Fatalf("proxy: %v", err)
+			}
+			return
+		}
 		if err := p.ListenAndServe(); err != nil {
 			log.Fatalf("proxy: %v", err)
 		}
@@ -137,48 +187,99 @@ func main() {
 		log.Fatalf("ssh: %v", err)
 	}
 	go func() {
+		if sshListener != nil {
+			if err := sshServer.Serve(sshListener); err != nil {
+				log.Fatalf("ssh: %v", err)
+			}
+			return
+		}
 		if err := sshServer.ListenAndServe(); err != nil {
 			log.Fatalf("ssh: %v", err)
 		}
 	}()
 
-	if *apiKey == "" {
-		log.Printf("WARNING: --api-key not set. The control API is unauthenticated.")
-		log.Printf("WARNING: Any process that can reach :10212 can issue and revoke tokens.")
-		log.Printf("WARNING: Set --api-key in production to prevent agent access to the control plane.")
-	}
-
 	// Token management API
 	mux := http.NewServeMux()
-	mux.HandleFunc("POST /tokens", requireAPIKey(*apiKey, handleIssueToken(store, creds, certs, sshKeys, auditLog)))
-	mux.HandleFunc("GET /tokens", requireAPIKey(*apiKey, handleListTokens(store)))
-	mux.HandleFunc("DELETE /tokens/{token}", requireAPIKey(*apiKey, handleRevokeToken(store, auditLog)))
-	mux.HandleFunc("DELETE /tasks/{task_id}/tokens", requireAPIKey(*apiKey, handleRevokeByTask(store, auditLog)))
-	mux.HandleFunc("GET /policies", requireAPIKey(*apiKey, handleListPolicies(pol)))
-	mux.HandleFunc("PUT /credentials/{id}", requireAPIKey(*apiKey, handleRotateCredential(creds, store, auditLog)))
-	mux.HandleFunc("PUT /credentials/{id}/cert", requireAPIKey(*apiKey, handleRotateCert(certs, auditLog)))
-	mux.HandleFunc("PUT /credentials/{id}/sshkey", requireAPIKey(*apiKey, handleRotateSSHKey(sshKeys, auditLog)))
-	mux.HandleFunc("POST /webhooks", requireAPIKey(*apiKey, handleRegisterWebhook(auditLog)))
-	mux.HandleFunc("GET /events", requireAPIKey(*apiKey, sseSink.ServeHTTP))
+	mux.HandleFunc("POST /tokens", requireAPIKey(controlKey, handleIssueToken(store, creds, certs, sshKeys, auditLog)))
+	mux.HandleFunc("GET /tokens", requireAPIKey(controlKey, handleListTokens(store)))
+	mux.HandleFunc("DELETE /tokens/{token}", requireAPIKey(controlKey, handleRevokeToken(store, auditLog)))
+	mux.HandleFunc("DELETE /tasks/{task_id}/tokens", requireAPIKey(controlKey, handleRevokeByTask(store, auditLog)))
+	mux.HandleFunc("GET /policies", requireAPIKey(controlKey, handleListPolicies(pol)))
+	mux.HandleFunc("PUT /credentials/{id}", requireAPIKey(controlKey, handleRotateCredential(creds, store, auditLog)))
+	mux.HandleFunc("PUT /credentials/{id}/cert", requireAPIKey(controlKey, handleRotateCert(certs, auditLog)))
+	mux.HandleFunc("PUT /credentials/{id}/sshkey", requireAPIKey(controlKey, handleRotateSSHKey(sshKeys, auditLog)))
+	mux.HandleFunc("POST /webhooks", requireAPIKey(controlKey, handleRegisterWebhook(auditLog)))
+	mux.HandleFunc("GET /events", requireAPIKey(controlKey, sseSink.ServeHTTP))
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 	})
 
-	log.Printf("api on %s", *apiAddr)
+	log.Printf("api on %s", reportedAPI)
+	log.Printf("ssh bastion on %s", reportedSSH)
 	log.Printf("ca cert: %s/ca.pem", caDir)
 	log.Printf("")
 	log.Printf("to use:")
-	log.Printf("  export HTTPS_PROXY=http://127.0.0.1%s", *proxyAddr)
+	log.Printf("  export HTTPS_PROXY=http://%s", reportedProxy)
 	log.Printf("  export SSL_CERT_FILE=%s/ca.pem", caDir)
 	log.Printf("")
 	log.Printf("issue a token:")
-	log.Printf(`  curl -X POST http://localhost%s/tokens \`, *apiAddr)
+	log.Printf(`  curl -X POST http://%s/tokens \`, reportedAPI)
 	log.Printf(`    -d '{"credential":"sk-ant-...","destinations":["api.anthropic.com"]}'`)
 
+	if apiListener != nil {
+		if err := http.Serve(apiListener, mux); err != nil {
+			log.Fatalf("api: %v", err)
+		}
+		return
+	}
 	if err := http.ListenAndServe(*apiAddr, mux); err != nil {
 		log.Fatalf("api: %v", err)
 	}
+}
+
+// resolveAPIKey answers the control API key, from a file when one is named.
+//
+// A key on the command line is readable from /proc by every process of this
+// user, so a file is the better place for it -- and it is where systemd's
+// LoadCredential= puts one, which is why $CREDENTIALS_DIRECTORY is consulted
+// without being asked for.
+// listeningOn answers where a server will actually be reachable: the activated
+// socket's own address when systemd passed one, and otherwise the flag.
+func listeningOn(ln net.Listener, addr string) string {
+	if ln != nil {
+		return ln.Addr().String()
+	}
+	return addr
+}
+
+func resolveAPIKey(key, file string) (string, error) {
+	if key != "" && file != "" {
+		return "", fmt.Errorf("-api-key and -api-key-file are alternatives; give one")
+	}
+	if key != "" {
+		return key, nil
+	}
+	if file == "" {
+		if dir := os.Getenv("CREDENTIALS_DIRECTORY"); dir != "" {
+			candidate := filepath.Join(dir, "api-key")
+			if _, err := os.Stat(candidate); err == nil {
+				file = candidate
+			}
+		}
+	}
+	if file == "" {
+		return "", nil
+	}
+	contents, err := os.ReadFile(file)
+	if err != nil {
+		return "", fmt.Errorf("reading %s: %w", file, err)
+	}
+	trimmed := strings.TrimSpace(string(contents))
+	if trimmed == "" {
+		return "", fmt.Errorf("%s is empty", file)
+	}
+	return trimmed, nil
 }
 
 func defaultDataDir() string {

@@ -75,7 +75,13 @@ func (s *Server) ListenAndServe() error {
 	if err != nil {
 		return fmt.Errorf("listen %s: %w", s.addr, err)
 	}
-	log.Printf("ssh bastion listening on %s", s.addr)
+	return s.Serve(ln)
+}
+
+// Serve accepts on a listener the caller already has, which is how a socket
+// passed in by systemd is used.
+func (s *Server) Serve(ln net.Listener) error {
+	log.Printf("ssh bastion listening on %s", ln.Addr())
 	for {
 		conn, err := ln.Accept()
 		if err != nil {

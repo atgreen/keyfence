@@ -75,17 +75,50 @@ In the recommended deployment, KeyFence runs as a sidecar in a podman pod or Kub
 
 ## Quick Start
 
+### Install
+
+Fedora, RHEL and derivatives:
+
+```bash
+sudo curl -o /etc/yum.repos.d/keyfence.repo \
+  https://atgreen.github.io/keyfence/rpm-repo/keyfence.repo
+sudo dnf install keyfence
+```
+
+Or take a binary from the [releases](https://github.com/atgreen/keyfence/releases),
+or `make build` from source.
+
+### As a user service (recommended)
+
+The package ships systemd user units, installed switched off. Enable the
+sockets rather than the service and systemd holds the ports, starting KeyFence
+on the first connection — an enabled broker with nothing to do costs nothing:
+
+```bash
+systemctl --user enable --now keyfence.socket keyfence-api.socket
+```
+
+That generates a control API key on first start at `~/.keyfence/api-key`,
+readable only by you, and keeps the CA at `~/.keyfence/ca/ca.pem`. Add
+`keyfence-ssh.socket` if you want the SSH bastion.
+
+A user service rather than a system one because what KeyFence holds is one
+person's credentials, and the tokens it mints are for that person's agents.
+
 ### Local (no containers)
 
 ```bash
 # Build
 make build
 
-# Start KeyFence
-./bin/keyfence
+# Start KeyFence. The control API can issue and revoke credentials, so it wants
+# a key; -insecure-api is how you say you meant to leave it open.
+umask 077; head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n' > ~/.keyfence/api-key
+./bin/keyfence -api-key-file ~/.keyfence/api-key
 
 # In another terminal — issue a token
 TOKEN=$(curl -sf -X POST http://localhost:10212/tokens \
+  -H "Authorization: Bearer $(cat ~/.keyfence/api-key)" \
   -d '{"credential":"sk-ant-your-real-key","destinations":["api.anthropic.com"],"ttl_seconds":300}' \
   | python3 -c "import sys,json; print(json.load(sys.stdin)['token'])")
 
@@ -139,20 +172,44 @@ Containers in the pod share a network namespace, so the agent reaches KeyFence a
 
 ## Control API Authentication
 
-In a container deployment, the agent can reach KeyFence on the shared network. To prevent the agent from issuing or revoking tokens directly, set `--api-key`:
+The control API issues and revokes credentials, so KeyFence refuses to start
+without a key for it unless you pass `-insecure-api` to say you meant to. Give
+it one of:
 
 ```bash
-keyfence --api-key "$KEYFENCE_API_KEY" --data-dir /data --certs-dir /certs
+keyfence -api-key-file /run/secrets/keyfence-api-key    # preferred
+keyfence -api-key "$KEYFENCE_API_KEY"                   # visible in /proc
 ```
 
-All control API endpoints (except `/health`) require the key as a Bearer token:
+A key on the command line can be read out of `/proc` by any process of the same
+user, which is why a file is better. Under systemd, `LoadCredential=` puts one
+in `$CREDENTIALS_DIRECTORY` and KeyFence looks there for `api-key` without being
+told to.
+
+All control API endpoints except `/health` require the key as a Bearer token:
 
 ```bash
 curl -H "Authorization: Bearer $KEYFENCE_API_KEY" \
   -X POST http://localhost:10212/tokens -d '...'
 ```
 
-The agent does not have this key. Without `--api-key`, KeyFence logs a warning at startup.
+The agent does not have this key — and under a sandbox that grants only the proxy
+port, it cannot reach the control API at all.
+
+### Where it listens
+
+The proxy, the SSH bastion and the control API bind **loopback** by default
+(`127.0.0.1:10210`, `:10211`, `:10212`). A broker that holds credentials has no
+business listening to the network because nobody said otherwise. Pass an
+explicit address to widen it — which is what the container image does, since a
+published port is forwarded to the container's own address:
+
+```bash
+keyfence -proxy 0.0.0.0:10210 -api 0.0.0.0:10212
+```
+
+In a podman pod the agent's container shares this network namespace, so loopback
+is already what it connects to.
 
 ## Token API
 
