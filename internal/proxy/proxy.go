@@ -15,7 +15,9 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
+	"path"
 	"sort"
 	"strings"
 	"time"
@@ -460,6 +462,28 @@ func (p *Proxy) processRequest(ctx context.Context, clientConn net.Conn, req *ht
 		attribute.String("keyfence.policy", token.PolicyName),
 	)
 
+	// Every path decision below reads req.URL.Path, and the request is forwarded
+	// with its path untouched. Those are the same question only for a path that
+	// cannot be rewritten on the way: "/repos/../user" satisfies a scope of
+	// "/repos/*" here and arrives upstream as "/user", which is the scope being
+	// escaped rather than enforced.
+	if !pathIsNormal(req.URL.Path) {
+		p.audit.Log(audit.Entry{
+			Event:       audit.EventDeny,
+			TokenID:     token.ID,
+			AgentID:     token.AgentID,
+			TaskID:      token.TaskID,
+			Destination: targetHost,
+			Method:      req.Method,
+			Path:        req.URL.Path,
+			DenyRule:    "path_not_normal",
+			DenyReason:  "request path is not in normal form, so what it scopes to here and what it resolves to upstream need not agree",
+		})
+		span.SetStatus(codes.Error, "path_not_normal")
+		writeError(clientConn, 400, fmt.Sprintf("request path %s is not in normal form", req.URL.Path))
+		return false
+	}
+
 	// Per-token rate limit (set by operator at issuance)
 	if token.RateLimit > 0 && !p.store.CheckRate(tokenValue) {
 		p.audit.Log(audit.Entry{
@@ -843,6 +867,72 @@ func headerNames(header http.Header) []string {
 	}
 	sort.Strings(names)
 	return names
+}
+
+// pathIsNormal answers whether a request path is already in the one form this
+// proxy and an upstream origin are guaranteed to read the same way.
+//
+// Path scoping is a decision about a string that KeyFence then hands on
+// unchanged, so it holds only while nothing downstream can rewrite that string.
+// A "." or ".." segment, or an empty one, is exactly what a normalising origin
+// does rewrite -- and it rewrites it after the scope has been checked.
+//
+// Resolving the path here instead would trade one disagreement for another: it
+// would authorise "/a/../b" as "/b" for an origin that may serve the literal
+// path and never resolve it at all. So a path that is not already normal is
+// refused rather than repaired, which leaves only paths no normaliser can move.
+// Go has already percent-decoded req.URL.Path, so an encoded "%2e%2e" is a ".."
+// by the time it is examined here.
+func pathIsNormal(reqPath string) bool {
+	// "OPTIONS *" carries no path to scope. It is not a request for a resource,
+	// and a token with any path scoping at all refuses it further down.
+	if reqPath == "" {
+		return true
+	}
+	if !strings.HasPrefix(reqPath, "/") {
+		return false
+	}
+	// path.Clean drops a trailing separator, which is a real distinction to an
+	// origin and not one of the rewrites this is looking for.
+	cleaned := path.Clean(reqPath)
+	if strings.HasSuffix(reqPath, "/") && cleaned != "/" {
+		cleaned += "/"
+	}
+	if cleaned != reqPath {
+		return false
+	}
+	// path.Clean models one origin's idea of a path. Others differ in ways that
+	// turn an ordinary-looking segment back into a "..": a ";" parameter that
+	// gets stripped, a "\" read as a separator, a second layer of
+	// percent-encoding that gets decoded. A segment only has to be a ".." to one
+	// of them for the scope checked here to be the wrong question.
+	if !segmentsAreOrdinary(reqPath) {
+		return false
+	}
+	if decoded, err := url.PathUnescape(reqPath); err == nil && decoded != reqPath {
+		return segmentsAreOrdinary(decoded)
+	}
+	return true
+}
+
+// segmentsAreOrdinary answers whether every segment of a path names something,
+// once the decorations an origin might strip are stripped and the separators it
+// might recognise are treated as separators.
+func segmentsAreOrdinary(reqPath string) bool {
+	segments := strings.Split(strings.ReplaceAll(reqPath, `\`, "/"), "/")
+	for i, segment := range segments {
+		// A leading separator, and a trailing one, do not introduce a segment.
+		if i == 0 || (i == len(segments)-1 && segment == "") {
+			continue
+		}
+		if idx := strings.IndexByte(segment, ';'); idx >= 0 {
+			segment = segment[:idx]
+		}
+		if segment == "" || segment == "." || segment == ".." {
+			return false
+		}
+	}
+	return true
 }
 
 // framedDeterminately answers whether a client can tell where this response
