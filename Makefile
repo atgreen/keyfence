@@ -3,9 +3,11 @@
 BINARY := keyfence
 BUILD_DIR := ./bin
 VERSION := $(shell awk '/^Version:/ {print $$2}' releng/keyfence.spec)
+BUILD_DATE := $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
+LDFLAGS ?= -X main.version=$(VERSION) -X main.buildDate=$(BUILD_DATE)
 
 build:
-	go build -o $(BUILD_DIR)/$(BINARY) ./cmd/keyfence
+	go build -ldflags "$(LDFLAGS)" -o $(BUILD_DIR)/$(BINARY) ./cmd/keyfence
 
 test:
 	./scripts/test.sh

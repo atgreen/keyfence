@@ -24,7 +24,13 @@ jobs:
       - id: version
         run: |
           if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
-            echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+            version="${GITHUB_REF_NAME#v}"
+            spec=$(awk '/^Version:/ {print $2}' releng/keyfence.spec)
+            if [ "${version}" != "${spec}" ]; then
+              echo "tag version ${version} does not match spec version ${spec}" >&2
+              exit 1
+            fi
+            echo "version=${version}" >> "$GITHUB_OUTPUT"
             echo "publish=true" >> "$GITHUB_OUTPUT"
           else
             # Not a release: version from the spec, with the commit after it, so
@@ -38,7 +44,10 @@ jobs:
   # Binaries for people who would rather not use a package.
   # ------------------------------------------------------------------
   binaries:
+    needs: version
     runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -51,14 +60,18 @@ jobs:
       - name: Build binaries
         run: |
           mkdir -p dist
+          BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          LDFLAGS="-s -w -X main.version=${VERSION} -X main.commit=${GITHUB_SHA} -X main.buildDate=${BUILD_DATE}"
           for GOOS in linux darwin; do
             for GOARCH in amd64 arm64; do
               CGO_ENABLED=0 GOOS=$GOOS GOARCH=$GOARCH \
-                go build -ldflags="-s -w" -o "dist/keyfence-${GOOS}-${GOARCH}" ./cmd/keyfence
+                go build -trimpath -buildvcs=false -ldflags="${LDFLAGS}" \
+                -o "dist/keyfence-${GOOS}-${GOARCH}" ./cmd/keyfence
             done
           done
           CGO_ENABLED=0 GOOS=windows GOARCH=amd64 \
-            go build -ldflags="-s -w" -o dist/keyfence-windows-amd64.exe ./cmd/keyfence
+            go build -trimpath -buildvcs=false -ldflags="${LDFLAGS}" \
+            -o dist/keyfence-windows-amd64.exe ./cmd/keyfence
 
       - uses: actions/upload-artifact@v4
         with:
@@ -79,6 +92,7 @@ jobs:
       image: almalinux:9
     env:
       VERSION: ${{ needs.version.outputs.version }}
+      KEYFENCE_COMMIT: ${{ github.sha }}
     steps:
       - name: Install build tools
         run: |
@@ -137,9 +151,13 @@ jobs:
     needs: [version, binaries, rpm]
     if: needs.version.outputs.publish == 'true'
     runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v4
+
       - uses: actions/download-artifact@v4
         with:
           name: binaries
@@ -153,9 +171,19 @@ jobs:
       - name: Generate checksums
         run: cd dist && sha256sum * > checksums.txt
 
+      - name: Extract release notes from changelog
+        run: |
+          awk -v heading="## [${VERSION}]" '
+            index($0, heading) == 1 { found = 1; next }
+            found && /^## \[/ { exit }
+            found { print }
+            END { if (!found) exit 1 }
+          ' CHANGELOG.md > release-notes.md
+          test -s release-notes.md
+
       - uses: softprops/action-gh-release@v2
         with:
-          generate_release_notes: true
+          body_path: release-notes.md
           files: |
             dist/keyfence-*
             dist/*.rpm
