@@ -20,7 +20,7 @@ import (
 // the bytes behind that never leave this process. It also means a revoked token
 // leaves nothing behind, because nothing was copied in to begin with.
 //
-// Three places are searched, in this order:
+// Four places are searched, in this order:
 //
 //  1. $CREDENTIALS_DIRECTORY/<name> — systemd's credential store, which is what
 //     LoadCredential= and SetCredential= populate. Readable only by the service.
@@ -35,11 +35,10 @@ import (
 // is a matter of replacing a file: the next request uses the new value and no
 // token has to be reissued.
 type NamedStore struct {
-	mu             sync.RWMutex
-	directories    []string
-	keyring        *Keyring
-	environ        func(string) string
-	rejectedReason map[string]string // name → why it cannot be used, for clear errors
+	mu          sync.RWMutex
+	directories []string
+	keyring     *Keyring
+	environ     func(string) string
 }
 
 // NewNamedStore answers a store searching systemd's credential directory and, if
@@ -53,9 +52,8 @@ func NewNamedStore(credentialsDir string) *NamedStore {
 		directories = append(directories, credentialsDir)
 	}
 	return &NamedStore{
-		directories:    directories,
-		environ:        os.Getenv,
-		rejectedReason: map[string]string{},
+		directories: directories,
+		environ:     os.Getenv,
 	}
 }
 
@@ -139,10 +137,12 @@ func (n *NamedStore) Resolve(name string) (string, error) {
 		return value, nil
 	}
 
-	return "", fmt.Errorf("no credential named %q: looked in %s%s and for %s",
-		name, n.describeDirectories(),
-		map[bool]string{true: ", in the keyring", false: ""}[keyring != nil],
-		variable)
+	searchDescription := n.describeDirectories()
+	if keyring != nil {
+		searchDescription += ", in the keyring"
+	}
+	return "", fmt.Errorf("no credential named %q: looked in %s and for %s",
+		name, searchDescription, variable)
 }
 
 // Has answers whether a name resolves, without handing back what it resolves to.
