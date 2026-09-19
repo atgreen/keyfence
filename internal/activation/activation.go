@@ -23,7 +23,6 @@ import (
 	"os"
 	"strconv"
 	"strings"
-	"syscall"
 )
 
 // listenFdsStart is the first file descriptor systemd passes, by convention.
@@ -63,9 +62,8 @@ func Listeners() (map[string][]net.Listener, error) {
 		fd := listenFdsStart + i
 
 		// Keep the descriptors out of any child's hands.
-		if _, _, errno := syscall.Syscall(syscall.SYS_FCNTL, uintptr(fd),
-			syscall.F_SETFD, syscall.FD_CLOEXEC); errno != 0 {
-			return nil, fmt.Errorf("marking activated fd %d close-on-exec: %w", fd, errno)
+		if err := setCloseOnExec(fd); err != nil {
+			return nil, fmt.Errorf("marking activated fd %d close-on-exec: %w", fd, err)
 		}
 
 		name := fmt.Sprintf("fd%d", fd)
