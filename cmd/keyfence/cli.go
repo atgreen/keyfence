@@ -34,7 +34,7 @@ func handleInformationalCommand(args []string, stdout, stderr io.Writer) (handle
 	switch args[0] {
 	case "-h", "--help":
 		if len(args) != 1 {
-			fmt.Fprintf(stderr, "%s: help does not take arguments\n\n", programName)
+			_, _ = fmt.Fprintf(stderr, "%s: help does not take arguments\n\n", programName)
 			rootUsage(stderr)
 			return true, 2
 		}
@@ -43,7 +43,7 @@ func handleInformationalCommand(args []string, stdout, stderr io.Writer) (handle
 
 	case "-V", "--version", "version":
 		if len(args) != 1 {
-			fmt.Fprintf(stderr, "%s: version does not take arguments\n", programName)
+			_, _ = fmt.Fprintf(stderr, "%s: version does not take arguments\n", programName)
 			return true, 2
 		}
 		printVersion(stdout)
@@ -61,7 +61,7 @@ func handleInformationalCommand(args []string, stdout, stderr io.Writer) (handle
 			credentialCommandUsage(stdout, args[2])
 			return true, 0
 		default:
-			fmt.Fprintf(stderr, "%s help: unknown topic %q\n\n", programName, strings.Join(args[1:], " "))
+			_, _ = fmt.Fprintf(stderr, "%s help: unknown topic %q\n\n", programName, strings.Join(args[1:], " "))
 			rootUsage(stderr)
 			return true, 2
 		}
@@ -71,7 +71,7 @@ func handleInformationalCommand(args []string, stdout, stderr io.Writer) (handle
 }
 
 func rootUsage(w io.Writer) {
-	fmt.Fprintf(w, `KeyFence securely swaps short-lived tokens for credentials used by AI agents.
+	_, _ = fmt.Fprintf(w, `KeyFence securely swaps short-lived tokens for credentials used by AI agents.
 
 Usage:
   keyfence [options]
@@ -127,7 +127,7 @@ func printVersion(w io.Writer) {
 	if dirty && revision != "unknown" {
 		revision += " (modified)"
 	}
-	fmt.Fprintf(w, `%s %s
+	_, _ = fmt.Fprintf(w, `%s %s
 commit: %s
 revision date: %s
 built: %s

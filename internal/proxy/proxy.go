@@ -845,31 +845,6 @@ func headerNames(header http.Header) []string {
 	return names
 }
 
-// maxDrainOnReuse bounds how much of an unread request body will be swallowed to
-// keep a connection usable. Beyond it, closing is cheaper than reading.
-const maxDrainOnReuse = 256 * 1024
-
-// requestBodyDrained consumes whatever is left of a request body, answering
-// whether the connection is safe to read another request from.
-//
-// This is the bug that made an agent report "Unable to connect to API
-// (Malformed_HTTP_Response)". An upstream that answers before reading the whole
-// request -- an error, a redirect -- leaves the rest of the body unread in the
-// tunnel, and the next ReadRequest then parses those bytes as a request. What
-// came back was a refusal aimed at a request nobody sent, arriving where the
-// client expected a response.
-//
-// Go's own HTTP server does exactly this before reusing a connection, for exactly
-// this reason.
-func requestBodyDrained(req *http.Request) bool {
-	if req.Body == nil {
-		return true
-	}
-	remaining, err := io.Copy(io.Discard, io.LimitReader(req.Body, maxDrainOnReuse+1))
-	_ = req.Body.Close()
-	return err == nil && remaining <= maxDrainOnReuse
-}
-
 // framedDeterminately answers whether a client can tell where this response
 // ended without waiting for the connection to close.
 func framedDeterminately(resp *http.Response) bool {

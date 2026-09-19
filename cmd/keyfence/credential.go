@@ -28,7 +28,7 @@ import (
 // Nothing here ever prints a secret.
 
 func credentialUsage(w io.Writer) {
-	fmt.Fprint(w, `Manage credentials by name without exposing their values.
+	_, _ = fmt.Fprint(w, `Manage credentials by name without exposing their values.
 
 Usage:
   keyfence credential <command> [options]
@@ -52,7 +52,7 @@ A credential is referenced by name in a token request or sandbox policy:
 func credentialCommandUsage(w io.Writer, command string) {
 	switch command {
 	case "add":
-		fmt.Fprint(w, `Store a named credential, reading the secret from stdin.
+		_, _ = fmt.Fprint(w, `Store a named credential, reading the secret from stdin.
 
 Usage:
   keyfence credential add [--file PATH] NAME
@@ -65,7 +65,7 @@ Example:
   gh auth token | keyfence credential add github
 `)
 	case "list":
-		fmt.Fprint(w, `List the credential names registered with a running broker.
+		_, _ = fmt.Fprint(w, `List the credential names registered with a running broker.
 
 Usage:
   keyfence credential list [options]
@@ -76,7 +76,7 @@ Options:
   -h, --help           Show help
 `)
 	case "rm":
-		fmt.Fprint(w, `Forget a named credential.
+		_, _ = fmt.Fprint(w, `Forget a named credential.
 
 Usage:
   keyfence credential rm [--file PATH] NAME
@@ -124,14 +124,14 @@ func runCredentialCommandWithIO(args []string, stdout, stderr io.Writer) (handle
 			credentialCommandUsage(stdout, args[2])
 			return true, 0
 		}
-		fmt.Fprintf(stderr, "keyfence credential help: unknown command %q\n\n", strings.Join(args[2:], " "))
+		_, _ = fmt.Fprintf(stderr, "keyfence credential help: unknown command %q\n\n", strings.Join(args[2:], " "))
 		credentialUsage(stderr)
 		return true, 2
 	}
 
 	command := args[1]
 	if !isCredentialCommand(command) {
-		fmt.Fprintf(stderr, "keyfence credential: unknown command %q\n\n", command)
+		_, _ = fmt.Fprintf(stderr, "keyfence credential: unknown command %q\n\n", command)
 		credentialUsage(stderr)
 		return true, 2
 	}
@@ -155,7 +155,7 @@ func runCredentialCommandWithIO(args []string, stdout, stderr io.Writer) (handle
 
 	rest := args[2:]
 	if err := set.Parse(rest); err != nil {
-		fmt.Fprintf(stderr, "keyfence credential %s: %v\n\n", command, err)
+		_, _ = fmt.Fprintf(stderr, "keyfence credential %s: %v\n\n", command, err)
 		credentialCommandUsage(stderr, command)
 		return true, 2
 	}
@@ -164,39 +164,39 @@ func runCredentialCommandWithIO(args []string, stdout, stderr io.Writer) (handle
 	switch command {
 	case "add":
 		if len(positional) != 1 {
-			fmt.Fprintln(stderr, "keyfence credential add: expected exactly one NAME")
-			fmt.Fprintln(stderr)
+			_, _ = fmt.Fprintln(stderr, "keyfence credential add: expected exactly one NAME")
+			_, _ = fmt.Fprintln(stderr)
 			credentialCommandUsage(stderr, command)
 			return true, 2
 		}
 		if err := credentialAdd(positional[0], file); err != nil {
-			fmt.Fprintf(stderr, "keyfence credential add: %v\n", err)
+			_, _ = fmt.Fprintf(stderr, "keyfence credential add: %v\n", err)
 			return true, 1
 		}
 		return true, 0
 
 	case "list":
 		if len(positional) != 0 {
-			fmt.Fprintln(stderr, "keyfence credential list: does not take arguments")
-			fmt.Fprintln(stderr)
+			_, _ = fmt.Fprintln(stderr, "keyfence credential list: does not take arguments")
+			_, _ = fmt.Fprintln(stderr)
 			credentialCommandUsage(stderr, command)
 			return true, 2
 		}
 		if err := credentialList(apiAddr, apiKeyFile); err != nil {
-			fmt.Fprintf(stderr, "keyfence credential list: %v\n", err)
+			_, _ = fmt.Fprintf(stderr, "keyfence credential list: %v\n", err)
 			return true, 1
 		}
 		return true, 0
 
 	case "rm":
 		if len(positional) != 1 {
-			fmt.Fprintln(stderr, "keyfence credential rm: expected exactly one NAME")
-			fmt.Fprintln(stderr)
+			_, _ = fmt.Fprintln(stderr, "keyfence credential rm: expected exactly one NAME")
+			_, _ = fmt.Fprintln(stderr)
 			credentialCommandUsage(stderr, command)
 			return true, 2
 		}
 		if err := credentialRemove(positional[0], file); err != nil {
-			fmt.Fprintf(stderr, "keyfence credential rm: %v\n", err)
+			_, _ = fmt.Fprintf(stderr, "keyfence credential rm: %v\n", err)
 			return true, 1
 		}
 		return true, 0
@@ -216,7 +216,7 @@ func defaultAPIKeyFile() string {
 // shell or an editor leaves on the end.
 func readSecretFromStdin() (string, error) {
 	if info, err := os.Stdin.Stat(); err == nil && info.Mode()&os.ModeCharDevice != 0 {
-		fmt.Fprintln(os.Stderr, "reading the secret from stdin; end it with ^D")
+		_, _ = fmt.Fprintln(os.Stderr, "reading the secret from stdin; end it with ^D")
 	}
 	contents, err := io.ReadAll(io.LimitReader(os.Stdin, 1<<20))
 	if err != nil {
@@ -303,7 +303,7 @@ func credentialList(apiAddr, apiKeyFile string) error {
 		where = append(where, "the OS keyring")
 	}
 	if len(where) > 0 {
-		fmt.Fprintf(os.Stderr, "\nfrom: %s\n", strings.Join(where, ", "))
+		_, _ = fmt.Fprintf(os.Stderr, "\nfrom: %s\n", strings.Join(where, ", "))
 	}
 	return nil
 }

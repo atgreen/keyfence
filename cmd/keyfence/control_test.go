@@ -55,13 +55,13 @@ func TestUnixControlAPIReadsPeerCredentials(t *testing.T) {
 		os.NewFile(uintptr(descriptors[0]), "peer-0"),
 		os.NewFile(uintptr(descriptors[1]), "peer-1"),
 	}
-	defer files[0].Close()
-	defer files[1].Close()
+	defer func() { _ = files[0].Close() }()
+	defer func() { _ = files[1].Close() }()
 	conn, err := net.FileConn(files[0])
 	if err != nil {
 		t.Fatalf("opening Unix connection: %v", err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	peer, err := socketPeerIdentity(conn)
 	if err != nil {
