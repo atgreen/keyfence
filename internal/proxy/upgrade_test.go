@@ -268,3 +268,65 @@ func TestTheCredentialReachesTheHandshakeItself(t *testing.T) {
 	}
 	_ = fmt.Sprint(resp.StatusCode)
 }
+
+// A token that has to look like something else.
+//
+// Not every client will carry an opaque string. Codex reads its credential from a
+// file, decodes it as a JWT, checks the expiry itself, and goes off to refresh
+// anything it cannot parse -- so handing it "kf_abc123" ends with the agent
+// obtaining a real credential of its own, which is the opposite of brokering.
+// Handing it "header.payload.kf_abc123" satisfies every check it makes.
+
+func TestATokenIsFoundInsideAValueShapedLikeAJWT(t *testing.T) {
+	for name, tc := range map[string]struct {
+		header, value    string
+		expectedToken    string
+		expectedSwapText string
+	}{
+		"an ordinary bearer": {
+			header: "Authorization", value: "Bearer kf_plain",
+			expectedToken: "kf_plain", expectedSwapText: "kf_plain",
+		},
+		"a token wearing a signature's place": {
+			header: "Authorization", value: "Bearer aGVhZGVy.cGF5bG9hZA.kf_inside",
+			expectedToken: "kf_inside",
+			// The whole value is replaced: an upstream wants its credential, not a
+			// JWT with someone else's credential where the signature was.
+			expectedSwapText: "aGVhZGVy.cGF5bG9hZA.kf_inside",
+		},
+		"an api key header": {
+			header: "X-Api-Key", value: "kf_apikey",
+			expectedToken: "kf_apikey", expectedSwapText: "kf_apikey",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			req, err := http.NewRequest("GET", "https://example.test/", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			req.Header.Set(tc.header, tc.value)
+			token, key, swap := findToken(req)
+			if token != tc.expectedToken {
+				t.Errorf("token = %q, want %q", token, tc.expectedToken)
+			}
+			if !strings.EqualFold(key, tc.header) {
+				t.Errorf("header = %q, want %q", key, tc.header)
+			}
+			if swap != tc.expectedSwapText {
+				t.Errorf("swap text = %q, want %q", swap, tc.expectedSwapText)
+			}
+		})
+	}
+}
+
+func TestADottedValueWithNoTokenInItIsNotOne(t *testing.T) {
+	req, err := http.NewRequest("GET", "https://example.test/", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A real JWT, carrying nobody's placeholder.
+	req.Header.Set("Authorization", "Bearer aGVhZGVy.cGF5bG9hZA.c2lnbmF0dXJl")
+	if token, _, _ := findToken(req); token != "" {
+		t.Errorf("found a token in an ordinary JWT: %q", token)
+	}
+}

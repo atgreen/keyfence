@@ -405,7 +405,7 @@ func (p *Proxy) processRequest(ctx context.Context, clientConn net.Conn, req *ht
 	defer span.End()
 
 	// Find kf_ token in any header
-	tokenValue, tokenHeader := findToken(req)
+	tokenValue, tokenHeader, swapText := findToken(req)
 	if tokenValue == "" && p.passedThrough(targetHost) {
 		// Named as needing no credential. Forwarded as it came, with nothing
 		// added, and recorded so that what went out without a token is visible.
@@ -598,7 +598,7 @@ func (p *Proxy) processRequest(ctx context.Context, clientConn net.Conn, req *ht
 			swapped := strings.Replace(string(decoded), tokenValue, realCredential, 1)
 			req.Header.Set(tokenHeader, "Basic "+base64.StdEncoding.EncodeToString([]byte(swapped)))
 		} else {
-			newVal := strings.Replace(currentVal, tokenValue, realCredential, 1)
+			newVal := strings.Replace(currentVal, swapText, realCredential, 1)
 			req.Header.Set(tokenHeader, newVal)
 		}
 	}
@@ -1068,13 +1068,32 @@ func (s *sseCapture) Close() error {
 // It checks plaintext header values first (Bearer tokens, API keys),
 // then decodes Basic auth headers to find tokens used as passwords
 // (e.g., git over HTTPS sends Authorization: Basic base64(user:kf_token)).
-func findToken(req *http.Request) (tokenValue, headerKey string) {
+// findToken answers the token a request carries: the value KeyFence knows it by,
+// the header it arrived in, and the exact text to swap the real credential in for.
+//
+// Those last two are usually the same string. They differ when a client will not
+// accept an opaque token -- codex reads its credential from a file, decodes it as
+// a JWT, checks the expiry itself, and goes off to refresh anything it cannot
+// parse. Given "header.payload.kf_abc123" it is satisfied, sends the whole thing
+// as a bearer, and never learns that the middle of its own credential was a
+// placeholder. What has to reach the upstream, though, is the real credential and
+// not a JWT with a swapped signature -- so the text replaced is the whole dotted
+// value, while the token looked up is the segment.
+func findToken(req *http.Request) (tokenValue, headerKey, swapText string) {
 	for key, values := range req.Header {
 		for _, val := range values {
 			// Check plaintext parts (covers Bearer, API key headers)
 			for _, part := range strings.Fields(val) {
 				if strings.HasPrefix(part, "kf_") {
-					return part, key
+					return part, key, part
+				}
+				// A token wearing the shape of something else.
+				if strings.Contains(part, ".") {
+					for _, segment := range strings.Split(part, ".") {
+						if strings.HasPrefix(segment, "kf_") {
+							return segment, key, part
+						}
+					}
 				}
 			}
 
@@ -1089,14 +1108,14 @@ func findToken(req *http.Request) (tokenValue, headerKey string) {
 					// Token could be the username or password
 					for _, p := range parts {
 						if strings.HasPrefix(p, "kf_") {
-							return p, key
+							return p, key, p
 						}
 					}
 				}
 			}
 		}
 	}
-	return "", ""
+	return "", "", ""
 }
 
 func writeError(conn net.Conn, status int, message string) {
