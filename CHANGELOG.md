@@ -40,6 +40,10 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 - Authenticate upstream SSH hosts with `known_hosts` by default.
 - Keep credentials only while a valid token references them, and resolve named
   credentials on each request so rotation takes effect automatically.
+- Refuse a proxied request whose path is not already in normal form, rather than
+  resolving it. A path carrying a `.`, `..`, or empty segment is rejected with
+  `path_not_normal`; this includes the URL-in-path shape `/fetch/https://host`,
+  which some clients use and which no longer reaches an upstream.
 
 ### Fixed
 
@@ -51,6 +55,17 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 - Secure file-backed credential replacement with atomic mode-0600 writes that do
   not follow destination symlinks.
 - Clear policy counters when token lineages are revoked or expire.
+
+### Security
+
+- Enforce destination path scoping and policy path rules against the path that
+  is actually forwarded. A path decision was made on the request path as it
+  arrived and the request was then forwarded with that path untouched, so a
+  token scoped to `api.github.com/repos/*` accepted `/repos/../user/keys` and a
+  normalising origin served `/user/keys` with the real credential injected. The
+  same gap let `//admin/keys` and `/./admin/keys` past a `denied_paths` rule.
+  Variants using a `;` parameter, a `\` separator, or double percent-encoding
+  are refused as well.
 
 ## [0.1.0] - 2026-03-12
 
