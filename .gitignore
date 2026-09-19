@@ -9,3 +9,4 @@ PRD.md
 .beads-credential-key
 .beads/proxieddb/
 /build/
+/.codex-sandbox/

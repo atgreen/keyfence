@@ -126,10 +126,14 @@ person's credentials, and the tokens it mints are for that person's agents.
 # Build
 make build
 
+# Explore the command-line interface
+./bin/keyfence --help
+./bin/keyfence --version
+
 # Start KeyFence. The control API can issue and revoke credentials, so it wants
-# a key; -insecure-api is how you say you meant to leave it open.
+# a key; --insecure-api is how you say you meant to leave it open.
 umask 077; head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n' > ~/.keyfence/api-key
-./bin/keyfence -api-key-file ~/.keyfence/api-key
+./bin/keyfence --api-key-file ~/.keyfence/api-key
 
 # In another terminal — issue a token
 TOKEN=$(curl -sf -X POST http://localhost:10212/tokens \
@@ -146,6 +150,50 @@ curl https://api.anthropic.com/v1/messages \
   -H "Content-Type: application/json" \
   -d '{"model":"claude-sonnet-4-20250514","max_tokens":64,"messages":[{"role":"user","content":"say hi"}]}'
 ```
+
+### Command-line interface
+
+KeyFence uses conventional long options and provides short options for its
+common informational commands:
+
+```text
+Usage:
+  keyfence [options]
+  keyfence credential <command> [options]
+  keyfence version
+```
+
+Use `-h` or `--help` for the main help, and ask for progressively more specific
+help without starting the broker:
+
+```bash
+keyfence --help
+keyfence help credential
+keyfence help credential add
+keyfence credential add --help
+```
+
+Version and build information are available in command and option form. It also
+prints the author, copyright, license, Go version, target platform, and source
+revision when that information was recorded by the build:
+
+```bash
+keyfence version
+keyfence -V
+keyfence --version
+```
+
+The credential commands are `add`, `list`, and `rm`. `add` reads the secret from
+standard input and none of the commands prints credential values:
+
+```bash
+gh auth token | keyfence credential add github
+keyfence credential list
+keyfence credential rm github
+```
+
+Run `keyfence --help` for the complete list of network, credential, TLS, and
+control API options and their defaults.
 
 ### Podman pod (sidecar)
 
@@ -188,12 +236,12 @@ Containers in the pod share a network namespace, so the agent reaches KeyFence a
 ## Control API Authentication
 
 The control API issues and revokes credentials, so KeyFence refuses to start
-without a key for it unless you pass `-insecure-api` to say you meant to. Give
+without a key for it unless you pass `--insecure-api` to say you meant to. Give
 it one of:
 
 ```bash
-keyfence -api-key-file /run/secrets/keyfence-api-key    # preferred
-keyfence -api-key "$KEYFENCE_API_KEY"                   # visible in /proc
+keyfence --api-key-file /run/secrets/keyfence-api-key    # preferred
+keyfence --api-key "$KEYFENCE_API_KEY"                   # visible in /proc
 ```
 
 A key on the command line can be read out of `/proc` by any process of the same
@@ -205,8 +253,8 @@ For local callers, a Unix socket avoids distributing that bearer key. Numeric
 UID and primary-GID allowlists are explicit and repeatable:
 
 ```bash
-keyfence -api unix:$XDG_RUNTIME_DIR/keyfence-control.sock \
-  -api-allow-uid "$(id -u)" -api-allow-group "$(id -g)"
+keyfence --api unix:$XDG_RUNTIME_DIR/keyfence-control.sock \
+  --api-allow-uid "$(id -u)" --api-allow-group "$(id -g)"
 
 curl --unix-socket "$XDG_RUNTIME_DIR/keyfence-control.sock" \
   -X POST http://localhost/tokens -d '...'
@@ -244,7 +292,7 @@ those means an agent cannot start — Claude Code reports "Failed to connect to
 api.anthropic.com: Status 401" and stops.
 
 ```bash
-keyfence -passthrough api.anthropic.com,platform.claude.com,raw.githubusercontent.com
+keyfence --passthrough api.anthropic.com,platform.claude.com,raw.githubusercontent.com
 ```
 
 Requests to those hosts are forwarded as they came: no token required, nothing
@@ -256,7 +304,7 @@ Some hosts cannot be named in advance — Codex fetches its plugin bundles from
 by being refused first. For those, name a domain:
 
 ```bash
-keyfence -passthrough 'chatgpt.com,*.oaiusercontent.com'
+keyfence --passthrough 'chatgpt.com,*.oaiusercontent.com'
 ```
 
 `*.oaiusercontent.com` matches any host under that domain, at a label boundary:
@@ -280,7 +328,7 @@ explicit address to widen it — which is what the container image does, since a
 published port is forwarded to the container's own address:
 
 ```bash
-keyfence -proxy 0.0.0.0:10210 -api 0.0.0.0:10212
+keyfence --proxy 0.0.0.0:10210 --api 0.0.0.0:10212
 ```
 
 In a podman pod the agent's container shares this network namespace, so loopback
@@ -364,7 +412,7 @@ one the caller hands over:
 # Register it once — a file whose name is the credential's name
 install -m600 /dev/null ~/.keyfence/credentials/anthropic
 printf '%s' "$ANTHROPIC_API_KEY" > ~/.keyfence/credentials/anthropic
-keyfence -credentials-dir ~/.keyfence/credentials ...
+keyfence --credentials-dir ~/.keyfence/credentials ...
 
 # Then mint tokens without ever holding the secret
 curl -H "Authorization: Bearer $KEYFENCE_API_KEY" \
@@ -379,16 +427,16 @@ bytes never leave the broker.
 
 Four places are searched, in order: `$CREDENTIALS_DIRECTORY/<name>` (which is
 what systemd's `LoadCredential=` populates), `<credentials-dir>/<name>`, the OS
-keyring with `-keyring`, and `KEYFENCE_CREDENTIAL_<NAME>` in the environment.
+keyring with `--keyring`, and `KEYFENCE_CREDENTIAL_<NAME>` in the environment.
 
 ### The keyring, so credentials are not plaintext on disk
 
-`-keyring` resolves names from the OS keyring as well:
+`--keyring` resolves names from the OS keyring as well:
 
 ```bash
 gh auth token | keyfence credential add github
 keyfence credential list
-keyfence -keyring ...
+keyfence --keyring ...
 ```
 
 `credential add` reads the secret from stdin and puts it in the keyring, so
@@ -488,11 +536,11 @@ Tokens can be issued with a named policy that restricts what the token is allowe
 | `open` | No restrictions beyond token validation and destination check. |
 | `standard` | Common HTTP methods, 1000 req/hour rate limit. |
 | `strict` | GET/POST only, JSON content type, 10 MiB body limit, 1000 req/hour. |
+| `readonly` | GET/HEAD only. Blocks all write operations. |
 
 A body limit applies whether or not a request declares its size. A chunked
 request — which declares none — is read up to the limit; past it the request is
 denied, and within it the body is forwarded intact with a known length.
-| `readonly` | GET/HEAD only. Blocks all write operations. |
 
 ```bash
 # Issue a readonly token — agent can list models but not create completions
@@ -743,8 +791,8 @@ upstream host and is not a shell on this machine.
 
 Without an entry, the session is refused and says so — the bastion holds a real
 private key, and offering it to whatever answers an address would undo the point
-of holding it. `-ssh-known-hosts` names a different file;
-`-ssh-insecure-host-keys` waives the check, which is a thing to do deliberately
+of holding it. `--ssh-known-hosts` names a different file;
+`--ssh-insecure-host-keys` waives the check, which is a thing to do deliberately
 and not by default. The file is read per session, so adding a host needs no
 restart.
 
@@ -805,10 +853,10 @@ make clean       # remove build artifacts
 
 Requires Go 1.25+.
 
-## Author
+## Author and license
 
 Anthony Green (<green@moxielogic.com>)
 
-## License
+Copyright (c) 2026 Anthony Green.
 
 MIT — see [LICENSE](LICENSE).

@@ -9,7 +9,7 @@
 //   - Token management API on 127.0.0.1:10212
 //
 // All three listen on loopback unless told otherwise, and the control API
-// refuses to run without a key unless -insecure-api says to. Under systemd it
+// refuses to run without a key unless --insecure-api says to. Under systemd it
 // can be socket-activated: see releng/keyfence.socket.
 //
 // KeyFence is service-agnostic. It doesn't know about Anthropic, OpenAI,
@@ -22,8 +22,8 @@
 //
 // Usage:
 //
-//	keyfence -api-key-file ~/.keyfence/api-key
-//	keyfence -data-dir ~/.keyfence         # specify data directory
+//	keyfence --api-key-file ~/.keyfence/api-key
+//	keyfence --data-dir ~/.keyfence         # specify data directory
 //
 // Issue a token:
 //
@@ -63,11 +63,29 @@ import (
 )
 
 func main() {
+	args := os.Args[1:]
+	if handled, status := handleInformationalCommand(args, os.Stdout, os.Stderr); handled {
+		if status != 0 {
+			os.Exit(status)
+		}
+		return
+	}
+
 	// "keyfence credential ..." sets one up and exits; anything else starts the
 	// broker as before.
-	if handled, status := runCredentialCommand(os.Args[1:]); handled {
-		os.Exit(status)
+	if handled, status := runCredentialCommand(args); handled {
+		if status != 0 {
+			os.Exit(status)
+		}
+		return
 	}
+
+	flag.CommandLine.SetOutput(os.Stderr)
+	flag.Usage = func() { rootUsage(flag.CommandLine.Output()) }
+	shortHelp := flag.Bool("h", false, "show help")
+	longHelp := flag.Bool("help", false, "show help")
+	shortVersion := flag.Bool("V", false, "show version and build information")
+	longVersion := flag.Bool("version", false, "show version and build information")
 
 	// Loopback by default. The control API issues credentials, and the proxy
 	// carries them; neither is something to publish on every interface because
@@ -93,6 +111,19 @@ func main() {
 	knownHosts := flag.String("ssh-known-hosts", "", "known_hosts file used to authenticate upstream SSH hosts (default <data-dir>/ssh/known_hosts)")
 	insecureHostKeys := flag.Bool("ssh-insecure-host-keys", false, "accept any upstream SSH host key (the bastion's key can then be used against an impostor)")
 	flag.Parse()
+	if *shortHelp || *longHelp {
+		rootUsage(os.Stdout)
+		return
+	}
+	if *shortVersion || *longVersion {
+		printVersion(os.Stdout)
+		return
+	}
+	if flag.NArg() != 0 {
+		fmt.Fprintf(os.Stderr, "keyfence: unexpected command or argument %q\n\n", flag.Arg(0))
+		flag.Usage()
+		os.Exit(2)
+	}
 
 	// Sockets systemd may have passed in. With socket activation the broker can
 	// be enabled without running: systemd holds the ports and starts this on the
@@ -129,16 +160,16 @@ func main() {
 		apiHasTCP = !apiHasUnix
 	}
 	if apiHasUnix && peerAllow.empty() {
-		log.Fatalf("refusing to start: a Unix control API requires at least one -api-allow-uid or -api-allow-group")
+		log.Fatalf("refusing to start: a Unix control API requires at least one --api-allow-uid or --api-allow-group")
 	}
 	if apiHasTCP && controlKey == "" && !*insecureAPI {
 		log.Fatalf("refusing to start: the TCP control API issues and revokes credentials, and " +
 			"no key was given.\n" +
-			"  Pass -api-key-file FILE (or -api-key), or -insecure-api if you " +
+			"  Pass --api-key-file FILE (or --api-key), or --insecure-api if you " +
 			"really mean to leave it open.")
 	}
 	if apiHasTCP && controlKey == "" {
-		log.Printf("WARNING: -insecure-api given. Any process that can reach %s can issue and revoke tokens.", *apiAddr)
+		log.Printf("WARNING: --insecure-api given. Any process that can reach %s can issue and revoke tokens.", *apiAddr)
 	}
 	reportedProxy := listeningOn(proxyListener, *proxyAddr)
 	reportedSSH := listeningOn(sshListener, *sshAddr)
@@ -150,7 +181,7 @@ func main() {
 	// Initialize OpenTelemetry (configured via OTEL_* env vars)
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
-	otelShutdown, err := telemetry.Init(ctx, "dev")
+	otelShutdown, err := telemetry.Init(ctx, version)
 	if err != nil {
 		log.Printf("otel init (tracing disabled): %v", err)
 	} else {
@@ -190,7 +221,7 @@ func main() {
 			named.UseKeyring(keyring)
 			log.Printf("keyring: resolving credentials from the OS keyring as well")
 		} else {
-			log.Printf("keyring: -keyring given but secret-tool is not installed; " +
+			log.Printf("keyring: --keyring given but secret-tool is not installed; " +
 				"install libsecret-tools, or leave credentials in files")
 		}
 	}
@@ -254,7 +285,7 @@ func main() {
 		knownHostsPath = filepath.Join(sshDir, "known_hosts")
 	}
 	if *insecureHostKeys {
-		log.Printf("WARNING: -ssh-insecure-host-keys given. An upstream host is not authenticated, "+
+		log.Printf("WARNING: --ssh-insecure-host-keys given. An upstream host is not authenticated, "+
 			"so the private key this bastion holds can be offered to whatever answers %s.", *sshAddr)
 	}
 	sshServer, err := sshproxy.New(*sshAddr, sshDir, store, sshKeys, auditLog,
@@ -311,7 +342,7 @@ func main() {
 	mux.HandleFunc("GET /events", requireControlAuth(controlKey, peerAllow, sseSink.ServeHTTP))
 	// The CA certificate, unauthenticated because it is public by definition:
 	// every agent behind this proxy has to trust it, and it is exported
-	// world-readable wherever -certs-dir points. Serving it means a client does
+	// world-readable wherever --certs-dir points. Serving it means a client does
 	// not have to know where KeyFence keeps its data directory -- which is the
 	// sort of thing that goes wrong quietly, as a TLS failure that reads like a
 	// network fault.
@@ -382,7 +413,7 @@ func listeningOn(ln net.Listener, addr string) string {
 
 func resolveAPIKey(key, file string) (string, error) {
 	if key != "" && file != "" {
-		return "", fmt.Errorf("-api-key and -api-key-file are alternatives; give one")
+		return "", fmt.Errorf("--api-key and --api-key-file are alternatives; give one")
 	}
 	if key != "" {
 		return key, nil
