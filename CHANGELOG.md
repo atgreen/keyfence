@@ -7,6 +7,19 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-09-19
+
+### Added
+
+- Find a token carried inside a dotted, JWT-shaped value, and swap the whole
+  value for the real credential. A client that will not carry an opaque string
+  can now be brokered: codex reads its credential from a file, decodes it as a
+  JWT, checks the expiry itself, and goes off to fetch a real credential of its
+  own for anything it cannot parse. Issued as `header.payload.kf_...` it is
+  satisfied and sends the whole thing as a bearer, while what reaches the
+  upstream is the credential alone. A token carried this way inside Basic
+  authentication is not recognised; the plain `kf_` form still is.
+
 ## [0.2.0] - 2026-09-18
 
 ### Added

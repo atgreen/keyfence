@@ -1,5 +1,5 @@
 Name:           keyfence
-Version:        0.2.0
+Version:        0.3.0
 Release:        1%{?dist}
 Summary:        Credential containment proxy for AI agents
 
@@ -79,6 +79,10 @@ install -Dpm 0644 releng/keyfence-ssh.socket %{buildroot}%{_userunitdir}/keyfenc
 %systemd_user_postun_with_restart keyfence.service
 
 %changelog
+* Sat Sep 19 2026 Anthony Green <green@moxielogic.com> - 0.3.0-1
+- Find a token inside a dotted, JWT-shaped value and swap the whole value, so a
+  client that decodes its own credential can be brokered.
+
 * Fri Sep 18 2026 Anthony Green <green@moxielogic.com> - 0.2.0-1
 - Add named credentials, keyring integration, token delegation, recent audit
   history, Unix control sockets, passthrough rules, and WebSocket proxying.
