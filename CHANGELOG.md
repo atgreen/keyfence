@@ -7,6 +7,25 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+### Added
+
+- Say, in KeyFence's own name, when a client refuses a certificate KeyFence
+  minted. Interception means the certificate a client verifies is KeyFence's,
+  but the client reports the refusal against the origin — `api.github.com`'s
+  certificate having expired — naming the one party in the exchange that did
+  not issue it. KeyFence now logs and audits (`cert_rejected`) which host, which
+  leaf and its validity window, whether that leaf was usable at the time, and
+  the CA path a client has to trust.
+
+  Both shapes the refusal takes are covered. A client that verifies before it
+  finishes the handshake sends an alert, and that is reported as certain. An
+  OpenSSL-based client on TLS 1.3 — curl, and so most of what an agent shells
+  out to — finishes the handshake first and then simply leaves, so the server
+  side sees a clean handshake and a connection that carries nothing; that is
+  reported as the likely cause, since a client is entitled to open a connection
+  and say nothing. It was this second shape that reached the log as a bare
+  `connection reset by peer`.
+
 ### Fixed
 
 - Reissue a cached certificate before it expires. Leaves are minted with 25

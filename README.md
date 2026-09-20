@@ -488,6 +488,20 @@ identifies a credential without containing any part of one.
 The buffer is bounded (2048 entries) and is a window on the recent past, not
 storage. For everything, subscribe to `GET /events` or read the log.
 
+A `cert_rejected` entry is there for the failure that otherwise reads as the
+origin's. KeyFence intercepts TLS, so the certificate a client verifies is one
+KeyFence minted — and a client that refuses it reports the refusal against
+`api.github.com`, naming the one party in the exchange that did not issue it.
+The entry carries the host and a `cert_reason` saying what KeyFence served,
+whether that leaf was usable at the time, and where the CA it has to trust
+lives. The same line goes to the proxy's log.
+
+A refusal does not always arrive as one. An OpenSSL-based client on TLS 1.3 —
+curl among them — finishes the handshake before it decides about the
+certificate, so KeyFence sees a clean handshake followed by a connection that
+carries no request. That is reported too, as the likely cause rather than a
+certain one: a client is entitled to open a connection and send nothing.
+
 ### What happens to a credential when its token goes
 
 A credential handed over at issuance is held so it can be swapped in on each

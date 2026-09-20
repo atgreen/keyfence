@@ -27,6 +27,7 @@ const (
 	EventSSHDeny      = "ssh_deny"
 	EventRotate       = "rotate"
 	EventResponseRule = "response_rule"
+	EventCertRejected = "cert_rejected"
 )
 
 // Entry is a single audit log record.
@@ -47,6 +48,7 @@ type Entry struct {
 	CredentialID  string `json:"credential_id,omitempty"`
 	RuleAction    string `json:"rule_action,omitempty"`
 	RuleReason    string `json:"rule_reason,omitempty"`
+	CertReason    string `json:"cert_reason,omitempty"`
 	Label         string `json:"label,omitempty"`
 	Policy        string `json:"policy,omitempty"`
 	TTL           string `json:"ttl,omitempty"`

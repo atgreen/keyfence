@@ -264,17 +264,8 @@ func (c *bufferedConn) Read(p []byte) (int, error) { return c.Reader.Read(p) }
 // issued for. So the destination is recovered from the handshake rather than from
 // the kernel -- no SO_ORIGINAL_DST, no socket cookie to correlate.
 func (p *Proxy) serveRedirectedTLS(conn net.Conn) {
-	var hostname string
-	tlsConn := tls.Server(conn, &tls.Config{
-		GetCertificate: func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
-			hostname = hello.ServerName
-			return p.ca.GetCertificate(hello)
-		},
-	})
-	if err := tlsConn.HandshakeContext(context.Background()); err != nil {
-		// No SNI is the interesting failure: a client dialling an IP literal
-		// cannot say where it meant to go, so there is nothing to proxy it to.
-		log.Printf("redirected TLS handshake: %v", err)
+	tlsConn, hostname, served, err := p.interceptTLS(context.Background(), conn)
+	if err != nil {
 		return
 	}
 	defer func() { _ = tlsConn.Close() }()
@@ -286,7 +277,7 @@ func (p *Proxy) serveRedirectedTLS(conn net.Conn) {
 		telemetry.WithSpanAttributes(attribute.String("net.peer.name", hostname)))
 	defer span.End()
 
-	p.serveTunnel(ctx, tlsConn, hostname, span)
+	p.serveTunnel(ctx, tlsConn, hostname, served, span)
 }
 
 // serveRedirectedPlain handles cleartext HTTP that arrived without a CONNECT.
@@ -306,7 +297,7 @@ func (p *Proxy) serveRedirectedPlain(conn net.Conn, first *http.Request) {
 	if !p.processRequest(ctx, conn, first, hostname) {
 		return
 	}
-	p.serveRequests(ctx, conn, bufio.NewReader(conn), hostname, "http", span)
+	p.serveRequests(ctx, conn, bufio.NewReader(conn), hostname, "http", nil, span)
 }
 
 // handleConnect handles HTTPS CONNECT tunneling with MITM.
@@ -338,25 +329,22 @@ func (p *Proxy) handleConnect(conn net.Conn, req *http.Request) {
 	}
 
 	// TLS handshake with client using our CA-signed cert
-	tlsConfig := &tls.Config{
-		GetCertificate: p.ca.GetCertificate,
-	}
-	tlsConn := tls.Server(conn, tlsConfig)
-	if err := tlsConn.HandshakeContext(req.Context()); err != nil {
-		log.Printf("TLS handshake for %s: %v", hostname, err)
+	tlsConn, _, served, err := p.interceptTLS(req.Context(), conn)
+	if err != nil {
 		span.SetStatus(codes.Error, "TLS handshake failed")
 		return
 	}
 	defer func() { _ = tlsConn.Close() }()
 
-	p.serveTunnel(ctx, tlsConn, hostname, span)
+	p.serveTunnel(ctx, tlsConn, hostname, served, span)
 }
 
 // serveTunnel serves requests on an established, decrypted connection, however it
 // came to be established: a CONNECT tunnel the client asked for, or a TLS stream
 // redirected here by the kernel.
-func (p *Proxy) serveTunnel(ctx context.Context, conn net.Conn, hostname string, span trace.Span) {
-	p.serveRequests(ctx, conn, bufio.NewReader(conn), hostname, "https", span)
+func (p *Proxy) serveTunnel(ctx context.Context, conn net.Conn, hostname string,
+	served *tls.Certificate, span trace.Span) {
+	p.serveRequests(ctx, conn, bufio.NewReader(conn), hostname, "https", served, span)
 }
 
 // serveRequests reads requests until the client stops sending them.
@@ -366,13 +354,23 @@ func (p *Proxy) serveTunnel(ctx context.Context, conn net.Conn, hostname string,
 // on loopback, and again to the upstream. HTTP/1.1 keep-alive is the client's
 // default, and this honours it: a request is followed by another on the same
 // connection unless one side says otherwise.
+//
+// served is the certificate KeyFence opened this connection with, or nil where
+// there was no interception: a client that takes one and then sends nothing is
+// saying something about that certificate, and holding it is what lets KeyFence
+// say what.
 func (p *Proxy) serveRequests(ctx context.Context, conn net.Conn, br *bufio.Reader,
-	hostname, scheme string, span trace.Span) {
-	for {
+	hostname, scheme string, served *tls.Certificate, span trace.Span) {
+	for carried := 0; ; carried++ {
 		req, err := http.ReadRequest(br)
 		if err != nil {
-			// EOF is the ordinary end of a keep-alive connection, not a fault.
-			if err != io.EOF {
+			switch {
+			case carried == 0 && served != nil:
+				p.reportSilentClient(hostname, served, err)
+				span.SetStatus(codes.Error, "client sent no request")
+			case err == io.EOF:
+				// The ordinary end of a keep-alive connection, not a fault.
+			default:
 				log.Printf("read request for %s: %v", hostname, err)
 				span.SetStatus(codes.Error, "read request")
 			}
