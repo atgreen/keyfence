@@ -135,6 +135,13 @@ func (ca *CA) CertPEM() []byte {
 	return ca.certPEM
 }
 
+// certRenewBefore is how much validity a cached certificate must have left
+// for it to be handed out again. A leaf that expires while the proxy is still
+// serving it fails verification inside the client, which reports the origin's
+// certificate as expired -- naming the one party in the exchange that did not
+// issue it.
+const certRenewBefore = time.Hour
+
 // GetCertificate returns a TLS certificate for the given hostname,
 // generating and caching it on the fly.
 func (ca *CA) GetCertificate(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
@@ -146,7 +153,7 @@ func (ca *CA) GetCertificate(hello *tls.ClientHelloInfo) (*tls.Certificate, erro
 	ca.mu.Lock()
 	defer ca.mu.Unlock()
 
-	if cached, ok := ca.cache[host]; ok {
+	if cached, ok := ca.cache[host]; ok && !expiringSoon(cached, time.Now()) {
 		return cached, nil
 	}
 
@@ -156,6 +163,17 @@ func (ca *CA) GetCertificate(hello *tls.ClientHelloInfo) (*tls.Certificate, erro
 	}
 	ca.cache[host] = cert
 	return cert, nil
+}
+
+// expiringSoon reports whether cert is too near its expiry to reuse. A
+// certificate whose leaf was never parsed counts as expiring: reissuing costs
+// one keygen, whereas trusting an unknown expiry costs every later connection
+// to that host for as long as the process lives.
+func expiringSoon(cert *tls.Certificate, now time.Time) bool {
+	if cert.Leaf == nil {
+		return true
+	}
+	return now.Add(certRenewBefore).After(cert.Leaf.NotAfter)
 }
 
 func (ca *CA) issueCert(host string) (*tls.Certificate, error) {
@@ -188,9 +206,15 @@ func (ca *CA) issueCert(host string) (*tls.Certificate, error) {
 		return nil, fmt.Errorf("creating cert for %s: %w", host, err)
 	}
 
+	leaf, err := x509.ParseCertificate(certDER)
+	if err != nil {
+		return nil, fmt.Errorf("parsing issued cert for %s: %w", host, err)
+	}
+
 	tlsCert := &tls.Certificate{
 		Certificate: [][]byte{certDER, ca.cert.Raw},
 		PrivateKey:  key,
+		Leaf:        leaf,
 	}
 	return tlsCert, nil
 }
