@@ -1,5 +1,5 @@
 Name:           keyfence
-Version:        0.3.0
+Version:        0.4.0
 Release:        1%{?dist}
 Summary:        Credential containment proxy for AI agents
 
@@ -79,6 +79,12 @@ install -Dpm 0644 releng/keyfence-ssh.socket %{buildroot}%{_userunitdir}/keyfenc
 %systemd_user_postun_with_restart keyfence.service
 
 %changelog
+* Sun Sep 20 2026 Anthony Green <green@moxielogic.com> - 0.4.0-1
+- Reissue a per-host certificate before it expires, rather than serving an
+  expired one for the life of the process.
+- Say, in KeyFence's own name, when a client refuses a certificate KeyFence
+  minted, instead of leaving the failure to be reported as the origin's.
+
 * Sat Sep 19 2026 Anthony Green <green@moxielogic.com> - 0.3.0-1
 - Find a token inside a dotted, JWT-shaped value and swap the whole value, so a
   client that decodes its own credential can be brokered.
