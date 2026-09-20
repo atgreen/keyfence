@@ -7,6 +7,16 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+### Fixed
+
+- Reissue a cached certificate before it expires. Leaves are minted with 25
+  hours of validity and cached per host, but the cache was consulted without
+  ever reading the expiry, so a broker running longer than that served an
+  expired certificate to the same host on every later connection and nothing
+  short of a restart reissued it. The client reported it as the origin's
+  certificate having expired, naming the one party in the exchange that did
+  not issue it.
+
 ## [0.3.0] - 2026-09-19
 
 ### Added
