@@ -23,6 +23,7 @@ import (
 // CA is a local certificate authority that generates per-host certificates
 // on the fly for TLS interception.
 type CA struct {
+	dir     string
 	cert    *x509.Certificate
 	key     *ecdsa.PrivateKey
 	certPEM []byte
@@ -38,7 +39,7 @@ func LoadOrCreateCA(dir string) (*CA, error) {
 
 	// Try loading existing CA
 	if _, err := os.Stat(certPath); err == nil {
-		return loadCA(certPath, keyPath)
+		return loadCA(dir)
 	}
 
 	// Create new CA
@@ -96,15 +97,15 @@ func LoadOrCreateCA(dir string) (*CA, error) {
 		return nil, fmt.Errorf("writing CA key: %w", err)
 	}
 
-	return &CA{cert: cert, key: key, certPEM: certPEM, cache: make(map[string]*tls.Certificate)}, nil
+	return &CA{dir: dir, cert: cert, key: key, certPEM: certPEM, cache: make(map[string]*tls.Certificate)}, nil
 }
 
-func loadCA(certPath, keyPath string) (*CA, error) {
-	certPEM, err := os.ReadFile(certPath)
+func loadCA(dir string) (*CA, error) {
+	certPEM, err := os.ReadFile(filepath.Join(dir, "ca.pem"))
 	if err != nil {
 		return nil, fmt.Errorf("reading CA cert: %w", err)
 	}
-	keyPEM, err := os.ReadFile(keyPath)
+	keyPEM, err := os.ReadFile(filepath.Join(dir, "ca-key.pem"))
 	if err != nil {
 		return nil, fmt.Errorf("reading CA key: %w", err)
 	}
@@ -127,7 +128,14 @@ func loadCA(certPath, keyPath string) (*CA, error) {
 		return nil, fmt.Errorf("parsing CA key: %w", err)
 	}
 
-	return &CA{cert: cert, key: key, certPEM: certPEM, cache: make(map[string]*tls.Certificate)}, nil
+	return &CA{dir: dir, cert: cert, key: key, certPEM: certPEM, cache: make(map[string]*tls.Certificate)}, nil
+}
+
+// CertPath is where the CA certificate sits on disk. A client that refuses a
+// KeyFence certificate has to be pointed at something it can trust, and this is
+// the thing.
+func (ca *CA) CertPath() string {
+	return filepath.Join(ca.dir, "ca.pem")
 }
 
 // CertPEM returns the CA certificate in PEM format (for clients to trust).
