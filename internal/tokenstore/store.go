@@ -513,6 +513,18 @@ func (s *Store) IssueChild(parentValue string, child ChildParams) (*Token, error
 // Lookup answers the token record whether or not it is still usable, which is
 // what a caller cleaning up after a token needs: Resolve deliberately answers
 // nothing for a token that has expired or been revoked.
+// Valid answers whether a token the caller already holds is still usable,
+// lineage included. Resolve cannot answer this for a token read back from disk:
+// the value it would be looked up by is the one thing never written down.
+func (s *Store) Valid(token *Token) bool {
+	if token == nil {
+		return false
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.isValidLocked(token)
+}
+
 func (s *Store) Lookup(tokenValue string) *Token {
 	s.mu.RLock()
 	defer s.mu.RUnlock()

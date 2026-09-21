@@ -762,13 +762,14 @@ func handleListTokens(store *tokenstore.Store) http.HandlerFunc {
 			TaskID       string   `json:"task_id,omitempty"`
 			ParentID     string   `json:"parent_id,omitempty"`
 			RootID       string   `json:"root_id,omitempty"`
+			CgroupID     uint64   `json:"cgroup_id,omitempty"`
 		}
 		result := make([]entry, 0, len(tokens))
 		for _, t := range tokens {
 			result = append(result, entry{
 				ID:           t.ID,
 				ExpiresAt:    t.ExpiresAt.Format(time.RFC3339),
-				Valid:        store.Resolve(t.Value) != nil,
+				Valid:        store.Valid(t),
 				Destinations: t.AllowedDestinations,
 				Label:        t.Label,
 				Policy:       t.PolicyName,
@@ -776,6 +777,7 @@ func handleListTokens(store *tokenstore.Store) http.HandlerFunc {
 				TaskID:       t.TaskID,
 				ParentID:     t.ParentID,
 				RootID:       t.RootID,
+				CgroupID:     t.AllowedCgroupID,
 			})
 		}
 		w.Header().Set("Content-Type", "application/json")

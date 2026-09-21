@@ -164,3 +164,29 @@ func TestAnAbsentStoreIsAnEmptyOne(t *testing.T) {
 		t.Errorf("a new store holds %d tokens, want 0", got)
 	}
 }
+
+func TestAReloadedTokenStillReportsItselfValid(t *testing.T) {
+	store, path := tempStore(t)
+	issued, err := store.Issue(IssueParams{CredentialID: "cred-1", TTL: time.Hour})
+	if err != nil {
+		t.Fatalf("Issue: %v", err)
+	}
+
+	restarted, err := LoadOrCreate(path)
+	if err != nil {
+		t.Fatalf("reopening: %v", err)
+	}
+	listed := restarted.List()
+	if len(listed) != 1 {
+		t.Fatalf("store holds %d tokens, want 1", len(listed))
+	}
+	// The value is the one thing never written down, so anything asking after
+	// a reloaded token has to ask by the record rather than by the secret.
+	if !restarted.Valid(listed[0]) {
+		t.Error("a reloaded token reports itself invalid")
+	}
+	if listed[0].Value != "" {
+		t.Error("a reloaded token carries a value it should not have")
+	}
+	_ = issued
+}
