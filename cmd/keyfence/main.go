@@ -63,6 +63,14 @@ import (
 )
 
 func main() {
+	// First, before a credential can reach this address space at all: a crash
+	// dump or a same-user ptrace would otherwise hand over every secret this
+	// process holds. "keyfence credential ..." handles one too, so this comes
+	// ahead of the subcommands as well.
+	if err := denyCoreDumpsAndTracing(); err != nil {
+		log.Printf("warning: core dumps and tracing are still permitted: %v", err)
+	}
+
 	args := os.Args[1:]
 	if handled, status := handleInformationalCommand(args, os.Stdout, os.Stderr); handled {
 		if status != 0 {

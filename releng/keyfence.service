@@ -73,3 +73,9 @@ SystemCallFilter=@system-service
 SystemCallFilter=~@privileged @resources @obsolete
 CapabilityBoundingSet=
 UMask=0077
+
+# A core dump of this process is every plaintext credential on the machine,
+# kept by systemd-coredump for whoever runs coredumpctl later. KeyFence clears
+# its own dumpable flag at startup, which also refuses a same-user ptrace; this
+# covers the window before that runs, and anything spawned underneath.
+LimitCORE=0
