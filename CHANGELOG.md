@@ -7,6 +7,37 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+### Added
+
+- Tokens now outlive the broker. They lived in memory only, so `systemctl
+  restart keyfence`, a crash under `Restart=on-failure`, or an upgrade
+  invalidated every token in flight — and a token cannot be replaced in a
+  running process, since the agent was handed it in its environment at launch.
+  An agent mid-task did not get an interruption, it got `invalid_token` for
+  ever and lost the task. The CA already survived a restart; the token map was
+  the one thing that did not.
+
+  What a token grants is now kept under the data directory as `tokens.json`,
+  filed by the SHA-256 of the token's value. The value itself is never written:
+  a hash can recognise a token somebody presents and cannot be presented as
+  one, so the file grants nothing to whoever reads it. Revocations, expiry,
+  delegation lineage, and the per-token request counters all survive with it —
+  a restart neither resurrects a revoked token nor refills a spent budget.
+
+  A token issued against a credential registered by name works straight through
+  a restart. One issued with an inline credential now resolves but cannot
+  reach its credential, the inline store being memory-only; that is tracked
+  separately.
+
+### Changed
+
+- The broker refuses core dumps and same-user `ptrace` of itself, clearing its
+  dumpable flag at startup and setting `LimitCORE=0` in the unit. A core dump
+  of this process is every plaintext credential on the machine, and on a host
+  with `ptrace_scope=0` — the default in containers and on several
+  distributions — any process of the same user could read them out of its
+  memory directly.
+
 ## [0.4.0] - 2026-09-20
 
 ### Added

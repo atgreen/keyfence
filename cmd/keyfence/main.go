@@ -219,7 +219,13 @@ func main() {
 	recent := audit.NewRecent(0)
 	auditLog.AddSink(recent)
 
-	store := tokenstore.New()
+	// Tokens outlive this process. An agent was handed its token at launch and
+	// nothing can replace it in a running process, so a broker that forgot its
+	// tokens on restart would end the agent's task rather than interrupt it.
+	store, err := tokenstore.LoadOrCreate(filepath.Join(*dataDir, "tokens.json"))
+	if err != nil {
+		log.Fatalf("token store: %v", err)
+	}
 	creds := credstore.NewEnvBackend()
 	// Credentials the operator registered by name, which a client can ask for
 	// without ever holding: it says "anthropic", and the bytes stay here.
@@ -242,6 +248,13 @@ func main() {
 
 	reaper := &credentialReaper{store: store, creds: creds, certs: certs, sshKeys: sshKeys, policies: pol}
 	go reaper.run(ctx, time.Minute)
+
+	// Issuing and revoking write themselves out at once. The per-request
+	// counters move too often for that, so they ride out here -- and on the way
+	// down, which is the restart this whole thing is about.
+	go store.FlushEvery(ctx.Done(), 5*time.Second, func(err error) {
+		log.Printf("warning: could not write the token store: %v", err)
+	})
 
 	// Register built-in policies
 	pol.Register(&policy.Policy{

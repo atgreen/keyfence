@@ -21,7 +21,7 @@ import (
 
 type Token struct {
 	ID                  string
-	Value               string                 // kf_<random>
+	Value               string                 `json:"-"` // kf_<random>, never stored
 	ParentID            string                 // public ID of the token this one was derived from
 	RootID              string                 // public ID at the root of the delegation chain
 	CredentialID        string                 // reference into credential backend
@@ -41,7 +41,7 @@ type Token struct {
 	SSHKeyID            string                 // reference to SSH key in SSH key store
 	ResponseRules       []ResponseRule         // Lua scripts evaluated against each response
 	RuleState           map[string]interface{} // mutable state persisted across requests
-	RuleStateMu         sync.Mutex             // protects RuleState
+	RuleStateMu         sync.Mutex             `json:"-"` // protects RuleState
 	CreatedAt           time.Time
 	ExpiresAt           time.Time
 	Label               string // optional human-readable label
@@ -247,8 +247,13 @@ type ResponseRule struct {
 
 type Store struct {
 	mu         sync.RWMutex
-	tokens     map[string]*Token // keyed by token value (kf_...)
+	tokens     map[string]*Token // keyed by ValueHash of the token value
 	tokensByID map[string]*Token // keyed by public, non-secret token ID
+
+	// path is where the store is kept between runs; empty means in memory
+	// only, which is what New gives a caller that does not want a file.
+	path  string
+	dirty bool
 }
 
 func New() *Store {
@@ -293,9 +298,13 @@ func (s *Store) Issue(p IssueParams) (*Token, error) {
 	}
 
 	s.mu.Lock()
-	s.tokens[token.Value] = token
+	s.tokens[ValueHash(token.Value)] = token
 	s.tokensByID[token.ID] = token
+	err = s.persistLocked()
 	s.mu.Unlock()
+	if err != nil {
+		return nil, err
+	}
 
 	return token, nil
 }
@@ -369,7 +378,7 @@ func (s *Store) IssueChild(parentValue string, child ChildParams) (*Token, error
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	parent := s.tokens[parentValue]
+	parent := s.tokens[ValueHash(parentValue)]
 	if parent == nil || !s.isValidLocked(parent) {
 		return nil, &AttenuationError{Reason: "parent token is invalid or expired"}
 	}
@@ -476,8 +485,11 @@ func (s *Store) IssueChild(parentValue string, child ChildParams) (*Token, error
 	if err != nil {
 		return nil, err
 	}
-	s.tokens[token.Value] = token
+	s.tokens[ValueHash(token.Value)] = token
 	s.tokensByID[token.ID] = token
+	if err := s.persistLocked(); err != nil {
+		return nil, err
+	}
 	return token, nil
 }
 
@@ -487,14 +499,14 @@ func (s *Store) IssueChild(parentValue string, child ChildParams) (*Token, error
 func (s *Store) Lookup(tokenValue string) *Token {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.tokens[tokenValue]
+	return s.tokens[ValueHash(tokenValue)]
 }
 
 func (s *Store) Resolve(tokenValue string) *Token {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	t, ok := s.tokens[tokenValue]
+	t, ok := s.tokens[ValueHash(tokenValue)]
 	if !ok {
 		return nil
 	}
@@ -526,12 +538,13 @@ func (s *Store) Revoke(tokenValue string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	t, ok := s.tokens[tokenValue]
+	t, ok := s.tokens[ValueHash(tokenValue)]
 	if !ok {
 		return false
 	}
 	t.Revoked = true
 	s.revokeDescendantsLocked(t.ID)
+	_ = s.persistLocked()
 	return true
 }
 
@@ -566,6 +579,9 @@ func (s *Store) RevokeByTaskID(taskID string) int {
 		if t.TaskID == taskID {
 			s.revokeDescendantsLocked(t.ID)
 		}
+	}
+	if count > 0 {
+		_ = s.persistLocked()
 	}
 	return count
 }
@@ -602,7 +618,7 @@ func (s *Store) CheckRate(tokenValue string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	t, ok := s.tokens[tokenValue]
+	t, ok := s.tokens[ValueHash(tokenValue)]
 	if !ok || !s.isValidLocked(t) {
 		return false
 	}
@@ -612,6 +628,7 @@ func (s *Store) CheckRate(tokenValue string) bool {
 		if current.RateLimit <= 0 {
 			continue
 		}
+		s.touchLocked()
 		if current.rateStart.IsZero() || now.Sub(current.rateStart) >= current.RateWindow {
 			current.rateCount = 1
 			current.rateStart = now
@@ -632,7 +649,7 @@ func (s *Store) CheckBudget(tokenValue string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	t, ok := s.tokens[tokenValue]
+	t, ok := s.tokens[ValueHash(tokenValue)]
 	if !ok || !s.isValidLocked(t) {
 		return false
 	}
@@ -642,6 +659,7 @@ func (s *Store) CheckBudget(tokenValue string) bool {
 			continue
 		}
 		current.requests++
+		s.touchLocked()
 		if current.requests > current.MaxRequests {
 			allowed = false
 		}
@@ -657,8 +675,8 @@ func (s *Store) Cleanup() []*Token {
 
 	var removed []*Token
 	invalid := make(map[string]bool)
-	for value, t := range s.tokens {
-		invalid[value] = !s.isValidLocked(t)
+	for key, t := range s.tokens {
+		invalid[key] = !s.isValidLocked(t)
 	}
 	for k, t := range s.tokens {
 		if invalid[k] {
@@ -666,6 +684,9 @@ func (s *Store) Cleanup() []*Token {
 			delete(s.tokensByID, t.ID)
 			removed = append(removed, t)
 		}
+	}
+	if len(removed) > 0 {
+		_ = s.persistLocked()
 	}
 	return removed
 }
