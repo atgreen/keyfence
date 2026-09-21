@@ -39,6 +39,7 @@ type Token struct {
 	ClientCertID        string                 // reference to cert+key in cert store
 	ClientCertHeader    string                 // header to inject cert PEM into (optional)
 	SSHKeyID            string                 // reference to SSH key in SSH key store
+	AllowedCgroupID     uint64                 // cgroup whose processes may present this token; 0 = any
 	ResponseRules       []ResponseRule         // Lua scripts evaluated against each response
 	RuleState           map[string]interface{} // mutable state persisted across requests
 	RuleStateMu         sync.Mutex             `json:"-"` // protects RuleState
@@ -282,6 +283,7 @@ type IssueParams struct {
 	ClientCertID        string
 	ClientCertHeader    string
 	SSHKeyID            string
+	AllowedCgroupID     uint64
 	ResponseRules       []ResponseRule
 }
 
@@ -342,6 +344,7 @@ func newToken(p IssueParams, now time.Time, parentID, rootID string) (*Token, er
 		ClientCertID:        p.ClientCertID,
 		ClientCertHeader:    p.ClientCertHeader,
 		SSHKeyID:            p.SSHKeyID,
+		AllowedCgroupID:     p.AllowedCgroupID,
 		ResponseRules:       append([]ResponseRule(nil), p.ResponseRules...),
 		RuleState:           make(map[string]interface{}),
 		CreatedAt:           now,
@@ -362,6 +365,7 @@ type ChildParams struct {
 	RateLimit           *int
 	RateWindow          *time.Duration
 	MaxRequests         *int
+	AllowedCgroupID     *uint64
 }
 
 // AttenuationError reports a requested child restriction that would widen or
@@ -457,6 +461,18 @@ func (s *Store) IssueChild(parentValue string, child ChildParams) (*Token, error
 		}
 	}
 
+	// A binding to a cgroup is a restriction like any other: a child may add
+	// one, and may not drop or replace the one it inherits. Replacing would be
+	// the whole point of an attack -- delegate yourself a copy that answers to
+	// your own cgroup instead.
+	cgroupID := parent.AllowedCgroupID
+	if child.AllowedCgroupID != nil {
+		if parent.AllowedCgroupID != 0 && *child.AllowedCgroupID != parent.AllowedCgroupID {
+			return nil, &AttenuationError{Reason: "child cannot be bound to a cgroup other than its parent's"}
+		}
+		cgroupID = *child.AllowedCgroupID
+	}
+
 	rootID := parent.RootID
 	if rootID == "" {
 		rootID = parent.ID
@@ -479,6 +495,7 @@ func (s *Store) IssueChild(parentValue string, child ChildParams) (*Token, error
 		ClientCertID:        parent.ClientCertID,
 		ClientCertHeader:    parent.ClientCertHeader,
 		SSHKeyID:            parent.SSHKeyID,
+		AllowedCgroupID:     cgroupID,
 		ResponseRules:       append([]ResponseRule(nil), parent.ResponseRules...),
 	}
 	token, err := newToken(params, now, parent.ID, rootID)

@@ -480,23 +480,27 @@ func exportCACert(ca *proxy.CA, dir string) error {
 }
 
 type issueRequest struct {
-	Credential        string                    `json:"credential"`
-	CredentialRef     string                    `json:"credential_ref"`
-	Destinations      []string                  `json:"destinations"`
-	TTLSeconds        int                       `json:"ttl_seconds"`
-	Label             string                    `json:"label"`
-	Policy            string                    `json:"policy"`
-	AgentID           string                    `json:"agent_id"`
-	TaskID            string                    `json:"task_id"`
-	RateLimit         int                       `json:"rate_limit"`
-	RateWindowSeconds int                       `json:"rate_window_seconds"`
-	MaxRequests       int                       `json:"max_requests"`
-	ClientCert        string                    `json:"client_cert"`
-	ClientKey         string                    `json:"client_key"`
-	ClientCertHeader  string                    `json:"client_cert_header"`
-	SSHPrivateKey     string                    `json:"ssh_private_key"`
-	SSHUsername       string                    `json:"ssh_username"`
-	ResponseRules     []tokenstore.ResponseRule `json:"response_rules"`
+	Credential        string   `json:"credential"`
+	CredentialRef     string   `json:"credential_ref"`
+	Destinations      []string `json:"destinations"`
+	TTLSeconds        int      `json:"ttl_seconds"`
+	Label             string   `json:"label"`
+	Policy            string   `json:"policy"`
+	AgentID           string   `json:"agent_id"`
+	TaskID            string   `json:"task_id"`
+	RateLimit         int      `json:"rate_limit"`
+	RateWindowSeconds int      `json:"rate_window_seconds"`
+	MaxRequests       int      `json:"max_requests"`
+	ClientCert        string   `json:"client_cert"`
+	ClientKey         string   `json:"client_key"`
+	ClientCertHeader  string   `json:"client_cert_header"`
+	SSHPrivateKey     string   `json:"ssh_private_key"`
+	SSHUsername       string   `json:"ssh_username"`
+	// CgroupID binds the token to one cgroup: only a process inside it may
+	// present the token, so a token that escapes the sandbox authenticates
+	// nothing. Scute passes the cgroup it created for the run.
+	CgroupID      uint64                    `json:"cgroup_id"`
+	ResponseRules []tokenstore.ResponseRule `json:"response_rules"`
 }
 
 type issueResponse struct {
@@ -621,6 +625,7 @@ func handleIssueToken(store *tokenstore.Store, creds credstore.Backend, certStor
 			ClientCertID:        clientCertID,
 			ClientCertHeader:    req.ClientCertHeader,
 			SSHKeyID:            sshKeyID,
+			AllowedCgroupID:     req.CgroupID,
 			ResponseRules:       req.ResponseRules,
 		})
 		if err != nil {

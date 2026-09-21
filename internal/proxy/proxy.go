@@ -29,6 +29,7 @@ import (
 	"github.com/keyfence/keyfence/internal/audit"
 	"github.com/keyfence/keyfence/internal/credstore"
 	"github.com/keyfence/keyfence/internal/luaengine"
+	"github.com/keyfence/keyfence/internal/peercgroup"
 	"github.com/keyfence/keyfence/internal/policy"
 	"github.com/keyfence/keyfence/internal/telemetry"
 	"github.com/keyfence/keyfence/internal/tokenstore"
@@ -451,6 +452,33 @@ func (p *Proxy) processRequest(ctx context.Context, clientConn net.Conn, req *ht
 		span.SetStatus(codes.Error, "invalid_token")
 		writeError(clientConn, 403, "invalid or expired keyfence token")
 		return false
+	}
+
+	// A token bound to a cgroup is not a bearer credential any more: it is
+	// worth nothing to a process outside the sandbox it was issued for, which
+	// is the same thing the opaque value already promises about being carried
+	// off the host. The check errs closed -- a peer we cannot identify is a
+	// peer we cannot say is allowed.
+	if token.AllowedCgroupID != 0 {
+		peer, err := peercgroup.Of(clientConn.LocalAddr(), clientConn.RemoteAddr())
+		if err != nil || peer != token.AllowedCgroupID {
+			reason := fmt.Sprintf("token is bound to cgroup %d", token.AllowedCgroupID)
+			if err != nil {
+				reason = fmt.Sprintf("%s, and this caller could not be identified: %v", reason, err)
+			}
+			p.audit.Log(audit.Entry{
+				Event:       audit.EventDeny,
+				TokenID:     token.ID,
+				Destination: targetHost,
+				Method:      req.Method,
+				Path:        req.URL.Path,
+				DenyRule:    "wrong_cgroup",
+				DenyReason:  reason,
+			})
+			span.SetStatus(codes.Error, "wrong_cgroup")
+			writeError(clientConn, 403, "this token cannot be used from here")
+			return false
+		}
 	}
 
 	span.SetAttributes(

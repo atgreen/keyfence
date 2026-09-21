@@ -9,6 +9,26 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ### Added
 
+- A token can be bound to a cgroup, and is then worth nothing outside it. Pass
+  `cgroup_id` when issuing, and only a process in that cgroup may present the
+  token: a `kf_` value that escapes the sandbox in a file, a log, a pasted
+  transcript or onto another machine authenticates nothing. Until now a token
+  was a bearer credential on a loopback port, so any process on the host could
+  use one it obtained; destination locking and a TTL bounded what that was
+  worth without stopping the use.
+
+  The kernel records, on every socket, the cgroup of the process that created
+  it, and hands it back through `sock_diag` as `INET_DIAG_CGROUP_ID` — which is
+  the inode of the cgroup directory, so whoever creates the cgroup can name it
+  with a plain `stat`. No privilege is required, no pid is involved, and the
+  binding cannot change for a socket's life. A caller the broker cannot
+  identify is refused rather than waved through, and a delegated token inherits
+  its parent's binding and may not replace it.
+
+  This is the local answer to what the CB4A draft addresses with DPoP, which is
+  unavailable here: DPoP needs the upstream API to validate the proof, and the
+  APIs agents call do not.
+
 - Tokens now outlive the broker. They lived in memory only, so `systemctl
   restart keyfence`, a crash under `Restart=on-failure`, or an upgrade
   invalidated every token in flight — and a token cannot be replaced in a
