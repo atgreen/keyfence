@@ -857,6 +857,42 @@ Trace spans include:
 - Credentials consumed locally for cryptographic operations (AWS SigV4 signing, JWT minting) — these require Tier 2/3 features not yet implemented
 - Tools that pin certificates and reject the MITM CA (these fail closed, which is correct)
 
+### Why the broker is not the vault you are thinking of
+
+Concentrating every credential in one process invites the obvious objection: you
+have built the highest-value target on the machine. For the credential brokers
+this design is usually compared against, that is exactly right. A broker serving
+a fleet holds every user's GitHub token, every team's API keys, and compromising
+it yields authority no single person involved ever had. That is what justifies
+the machinery those systems carry — envelope encryption, a key that never leaves
+a KMS, a separate service that must approve each unwrap so that the component
+holding the ciphertext cannot authorise reading it.
+
+KeyFence is not that, and the difference is architectural rather than a
+mitigation. It runs as **a user service, one per person**, holding the
+credentials that person already has. An attacker who can compromise the broker
+is an attacker already running as you — and can read `~/.keyfence/credentials`,
+your shell history, your SSH keys and your browser session without going
+anywhere near KeyFence. The broker is not a step up in authority for them. It
+holds nothing they did not already hold.
+
+That is also why the hardening here looks different. There is no second trust
+domain on your laptop to move the decision into: the keyring, a TPM, another
+process — all of them answer to your uid, so none of them can refuse your uid.
+What is worth defending against is everything that is *not* running as you, and
+that is defensible: the process clears its dumpable flag at startup, so a core
+dump cannot write your credentials to disk and a same-user `ptrace` cannot read
+them out of memory; `LimitCORE=0` says the same thing for the window before that
+runs; and [the keyring](#the-keyring-so-credentials-are-not-plaintext-on-disk)
+keeps them encrypted at rest against a backup, a snapshot, or a disk read while
+nobody is logged in.
+
+The argument has a boundary, and it is the deployment. Run one KeyFence for more
+than one person — on a shared box, or a CI runner brokering for several
+projects — and it becomes the fleet vault this section says it is not, without
+acquiring any of the protections a fleet vault needs. Don't. One per user is not
+a packaging convenience; it is the reason the rest of this holds.
+
 ## Development
 
 ```bash
