@@ -73,6 +73,14 @@ KeyFence is a credential containment proxy for bearer tokens, Basic auth, mTLS c
 
 In the recommended deployment, KeyFence runs as a sidecar in a podman pod or Kubernetes pod. The agent reaches the proxy at `127.0.0.1:10210`. The agent never has real credentials — even if it bypasses the proxy, it has nothing valuable to exfiltrate.
 
+### Paired with Scute
+
+KeyFence puts the credential out of reach. It does not make itself unavoidable: an agent that ignores `HTTPS_PROXY` reaches the internet directly, carrying nothing worth stealing but nothing stopping it from sending whatever it read. Routing is left to the program, and a program that was talked into something is exactly what this is defending against.
+
+[**Scute**](https://github.com/atgreen/scute) closes that, and the two are built to go together — Scute's default network is a KeyFence, and its package depends on this one. It runs the agent in a native Linux sandbox — Landlock for the filesystem, seccomp, namespaces, cgroup limits, no container and no root — and an eBPF program attached to the sandbox's cgroup rewrites the destination of every outbound connection to the broker, so a client that never heard of a proxy arrives here anyway. Where that privilege is not available, Landlock permits the broker's port and nothing else. Either way the sandbox has no route around KeyFence, and a policy that says nothing about the network gets one that goes through it.
+
+It mints a token per run and revokes it when the run ends, so a token recorded from a finished run is already dead. Bind it with [`cgroup_id`](#token-properties) and it is dead outside the sandbox too, whether the run is over or not.
+
 ## Quick Start
 
 ### Install
@@ -540,6 +548,7 @@ curl http://localhost:10212/policies
 | **Policy-bound** | Optional policy restricts HTTP methods, paths, rate limits, body size, and content types. |
 | **Revocable** | Instant invalidation without rotating the underlying credential. |
 | **Opaque** | The agent never sees the real credential. Even if the token leaks, it's expired and destination-locked. |
+| **Cgroup-bound** (optional) | `cgroup_id` at issue time names the cgroup whose processes may present the token. The kernel reports the cgroup that opened the connection a request arrives on, and anything else is refused — so a token carried out of the sandbox, in a file, a log, or a pasted transcript, authenticates nothing. A delegated token inherits the binding and cannot replace it. Linux only; the id is the inode of the cgroup directory, which is what [Scute](#paired-with-scute) already knows for the sandbox it made. |
 
 ## Policies
 
